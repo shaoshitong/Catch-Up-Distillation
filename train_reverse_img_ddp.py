@@ -355,7 +355,6 @@ def main(rank: int, world_size: int, arg):
     if arg.resume is not None:
         optimizer.load_state_dict(training_state['optimizer_state_dict'])
         print(f"Loaded training state from {arg.resume} at iter {start_iter}")
-        del training_state
     
     # DDP
     flow_model = DDP(flow_model, device_ids=[rank])

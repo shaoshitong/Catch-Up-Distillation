@@ -191,7 +191,7 @@ class ResidualFlow(RectifiedFlow):
 
   def get_train_tuple(self, z0=None, z1=None, t = None, N=2):
     if t is None:
-      t = torch.randint(1,self.N+1,(z1.shape[0],1),device=self.device).float()/self.N
+      t = torch.randint(0,self.N+1,(z1.shape[0],1),device=self.device).float()/self.N
     z1 = self.sample_residual_ode(z1=z1,N=N)
     if len(z1.shape) == 2:
       z_t =  t * z1 + (1.-t) * z0
@@ -233,7 +233,7 @@ class ResidualFlow(RectifiedFlow):
       raise ValueError("N must be odd when using Heun's method.")
     if solver == 'heun':
       N = (N + 1) // 2
-    dt = -1./N
+    dt = -1./ N
     traj = [] # to store the trajectory
     x0hat_list = []
     z = z1.detach().clone()
@@ -251,7 +251,7 @@ class ResidualFlow(RectifiedFlow):
           vt = self.model_list[i](z, t.squeeze())
           if solver == 'heun' and j > 1:
             z_next = z.detach().clone() + vt * dt
-            vt_next = self.model(z_next, t_next.squeeze())
+            vt_next = self.model_list[i](z_next, t_next.squeeze())
             vt = (vt + vt_next) / 2
           x0hat = z - vt * t.view(-1,1,1,1)
           x0hat_list.append(x0hat)

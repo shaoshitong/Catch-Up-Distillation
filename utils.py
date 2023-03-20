@@ -128,3 +128,10 @@ def d_1_minus_alpha_sq_dt(t):
     b = 0.1
     alpha_t = alpha(t)
     return 0.5 * (1 - alpha_t ** 2) ** (-0.5) * (-2 * alpha_t) * dalpha_dt(t)
+def convert_ddp_state_dict_to_single(ddp_state_dict):
+    single_state_dict = {}
+    for key, value in ddp_state_dict.items():
+        # 去掉 "module." 前缀
+        new_key = key.replace('module.', '') if key.startswith('module.') else key
+        single_state_dict[new_key] = value
+    return single_state_dict

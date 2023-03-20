@@ -1,7 +1,7 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
-python train_residual_reverse_img_ddp.py --N 16 --residual-number 3 --gpu 2,3,4,5 --dir ./runs/cifar10-residual-beta20/ --weight_prior 20 --learning_rate 8e-4 --dataset cifar10 --warmup_steps 1000 --optimizer adam --batchsize 256 --iterations 5000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json
+python train_residual_reverse_img_ddp.py --N 16 --residual-number 3 --gpu 2,3,4,5 --dir ./runs/cifar10-residual-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 10000 --optimizer adam --batchsize 64 --iterations 50000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --resume ./runs/cifar10-residual-beta20/training_state_latest.pth 
 """
 import torch
 import numpy as np
@@ -14,7 +14,7 @@ from guided_diffusion.unet import UNetModel
 import torchvision.datasets as dsets
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
-from utils import straightness, get_kl
+from utils import straightness, get_kl, convert_ddp_state_dict_to_single
 from dataset import CelebAHQImgDataset
 import argparse
 from tqdm import tqdm
@@ -73,10 +73,10 @@ def get_args():
 
 
 def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_loader, iterations, device, start_iter, warmup_steps, dir, learning_rate, independent,
-                         ema_after_steps, use_ema, samples_test, sampling_steps, world_size, weight_prior,T_N):
+                         ema_after_steps, use_ema, samples_test, sampling_steps, world_size, weight_prior,T_N, residual_number):
     for i in range(len(rectified_flow.model_list)-1):
         rectified_flow.model_list[i].eval()
-    
+    has_iter_residual_number = iterations * (residual_number+1)
     if rank == 0:
         writer = tensorboardX.SummaryWriter(log_dir=dir)
     samples_test = samples_test.to(device)
@@ -101,15 +101,17 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             z = torch.randn_like(x)
             loss_prior = 0
         else:
-            z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
-            loss_prior = get_kl(mu, logvar)
-
+            if residual_number>3:
+                with torch.no_grad():
+                    z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
+                loss_prior = 0
+            else:
+                z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
+                loss_prior = get_kl(mu, logvar)
         z_t, t, target = rectified_flow.get_train_tuple(z0=x, z1=z,N=T_N)
-        
         
         # Learn reverse model
         pred = rectified_flow.model(z_t, t.squeeze())
-
 
         loss_fm = torch.mean((target - pred)**2)
         loss_fm = loss_fm.mean()
@@ -123,16 +125,17 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         # Gather loss from all processes using torch.distributed.all_gather
         
 
-
+        if isinstance(loss_prior,torch.Tensor):
+            loss_prior = loss_prior.item()
         if i % 100 == 0 and rank == 0:
-            print(f"Iteration {i}: loss {loss.item()}, loss_fm {loss_fm.item()}")
+            print(f"Iteration {i+has_iter_residual_number}: loss {loss.item()}, loss_fm {loss_fm.item()}, loss_prior {loss_prior:.8f}")
             writer.add_scalar("loss", loss.item(), i)
             writer.add_scalar("loss_fm", loss_fm.item(), i)
             writer.add_scalar("loss_prior", loss_prior, i)
             writer.add_scalar("lr", optimizer.param_groups[0]['lr'], i)
             # Log to .txt file
             with open(os.path.join(dir, 'log.txt'), 'a') as f:
-                f.write(f"Iteration {i}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
+                f.write(f"Iteration {i+has_iter_residual_number}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
 
         if i % 1000 == 1 and rank == 0:
             rectified_flow.model.eval()
@@ -156,8 +159,8 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
                 reverse_straightness = straightness(traj_reverse)
 
                 print(f"Uncond straightness: {uncond_straightness.item()}, reverse straightness: {reverse_straightness.item()}")
-                writer.add_scalar("uncond_straightness", uncond_straightness.item(), i)
-                writer.add_scalar("reverse_straightness", reverse_straightness.item(), i)
+                writer.add_scalar("uncond_straightness", uncond_straightness.item(), i+has_iter_residual_number)
+                writer.add_scalar("reverse_straightness", reverse_straightness.item(), i+has_iter_residual_number)
 
                 traj_reverse = torch.cat(traj_reverse, dim=0)
                 traj_reverse_x0 = torch.cat(traj_reverse_x0, dim=0)
@@ -167,13 +170,13 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
                 traj_uncond_N4 = torch.cat(traj_uncond_N4, dim=0)
                 traj_uncond_x0_N4 = torch.cat(traj_uncond_x0_N4, dim=0)
 
-                save_image(traj_reverse*0.5 + 0.5, os.path.join(dir, f"traj_reverse_{i}.jpg"), nrow=4)
-                save_image(traj_reverse_x0*0.5 + 0.5, os.path.join(dir, f"traj_reverse_x0_{i}.jpg"), nrow=4)
-                save_image(traj_forward*0.5 + 0.5, os.path.join(dir, f"traj_forward_{i}.jpg"), nrow=4)
-                save_image(traj_uncond*0.5 + 0.5, os.path.join(dir, f"traj_uncond_{i}.jpg"), nrow=4)
-                save_image(traj_uncond_x0*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_{i}.jpg"), nrow=4)
-                save_image(traj_uncond_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_N4_{i}.jpg"), nrow=4)
-                save_image(traj_uncond_x0_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_N4_{i}.jpg"), nrow=4)
+                save_image(traj_reverse*0.5 + 0.5, os.path.join(dir, f"traj_reverse_{i+has_iter_residual_number}.jpg"), nrow=4)
+                save_image(traj_reverse_x0*0.5 + 0.5, os.path.join(dir, f"traj_reverse_x0_{i+has_iter_residual_number}.jpg"), nrow=4)
+                save_image(traj_forward*0.5 + 0.5, os.path.join(dir, f"traj_forward_{i+has_iter_residual_number}.jpg"), nrow=4)
+                save_image(traj_uncond*0.5 + 0.5, os.path.join(dir, f"traj_uncond_{i+has_iter_residual_number}.jpg"), nrow=4)
+                save_image(traj_uncond_x0*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_{i+has_iter_residual_number}.jpg"), nrow=4)
+                save_image(traj_uncond_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_N4_{i+has_iter_residual_number}.jpg"), nrow=4)
+                save_image(traj_uncond_x0_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_N4_{i+has_iter_residual_number}.jpg"), nrow=4)
             if use_ema:
                 optimizer.swap_parameters_with_ema(store_params_in_ema=True)
             rectified_flow.model.train()
@@ -185,27 +188,29 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         if i % 50000 == 0 and rank == 0:
             if use_ema:
                 optimizer.swap_parameters_with_ema(store_params_in_ema=True)
-                torch.save(get_model_list(rectified_flow), os.path.join(dir, f"flow_model_{i}_ema.pth"))
+                torch.save(get_model_list(rectified_flow), os.path.join(dir, f"flow_model_{i+has_iter_residual_number}_ema.pth"))
                 if forward_model is not None:
-                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_{i}_ema.pth"))
+                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_{i+has_iter_residual_number}_ema.pth"))
                 optimizer.swap_parameters_with_ema(store_params_in_ema=True)
             else:
-                torch.save(get_model_list(rectified_flow), os.path.join(dir, f"flow_model_{i}.pth"))
+                torch.save(get_model_list(rectified_flow), os.path.join(dir, f"flow_model_{i+has_iter_residual_number}.pth"))
                 if forward_model is not None:
-                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_{i}.pth"))
+                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_{i+has_iter_residual_number}.pth"))
             # Save training state
             d = {}
             d['optimizer_state_dict'] = optimizer.state_dict()
+            d['residual_number'] = residual_number
             d['model_state_dict'] = get_model_list(rectified_flow)
             if forward_model is not None:
                 d['forward_model_state_dict'] = forward_model.module.state_dict()
             d['iter'] = i
             # save
-            torch.save(d, os.path.join(dir, f"training_state_{i}.pth"))  
+            torch.save(d, os.path.join(dir, f"training_state_{i+has_iter_residual_number}.pth"))  
         if i % 5000 == 0 and rank == 0 and i > 0:
             # Save the latest training state
             d = {}
             d['optimizer_state_dict'] = optimizer.state_dict()
+            d['residual_number'] = residual_number
             d['model_state_dict'] = get_model_list(rectified_flow)
             if forward_model is not None:
                 d['forward_model_state_dict'] = forward_model.module.state_dict()
@@ -261,7 +266,6 @@ def get_loader(dataset, batchsize, world_size, rank):
 
     data_loader = torch.utils.data.DataLoader(dataset=dataset_train,
                                             batch_size=batchsize,
-                                            shuffle=False,
                                             drop_last=True,
                                             num_workers=4,
                                             sampler = DistributedSampler(dataset_train, num_replicas=world_size, rank=rank))
@@ -301,7 +305,7 @@ def main(rank: int, world_size: int, arg):
     if arg.resume is not None:
         training_state = torch.load(arg.resume, map_location = 'cpu')
         start_iter = training_state['iter']
-        start_residual_number =  training_state['residual_number']
+        start_residual_number = training_state['residual_number']
         model_list = []
         if config_de['unet_type'] == 'adm':
             model_class = UNetModel
@@ -312,11 +316,12 @@ def main(rank: int, world_size: int, arg):
 
         for ii in range(start_residual_number+1):
             sub_flow_model = copy.deepcopy(flow_model)
-            sub_flow_model.load_state_dict(training_state['model_state_dict_list'][ii])
+            sub_flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][ii]))
             model_list.append(sub_flow_model)
         flow_model = model_list[-1]
         if forward_model is not None:
-            forward_model.load_state_dict(training_state['forward_model_state_dict'])
+            forward_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['forward_model_state_dict']))
+        print("Successfully Load Checkpoint!")
     else:
         start_iter = 0
         start_residual_number = 0
@@ -324,7 +329,9 @@ def main(rank: int, world_size: int, arg):
         flow_model = torch.compile(flow_model,backend="inductor")
         model_list = [flow_model]
 
+
     for ii in range(start_residual_number, arg.residual_number):
+
         if ii != start_residual_number:
             flow_model = model_class(**config_de)
             flow_model = torch.compile(flow_model,backend="inductor")
@@ -351,7 +358,7 @@ def main(rank: int, world_size: int, arg):
                 pytorch_total_params = pytorch_total_params / 1000000
                 print(f"Total number of the forward parameters: {pytorch_total_params}M")
                 # Save the configuration of encoder to a json file
-                config_dict = forward_model.encoder.config
+                config_dict = forward_model.encoder.config if not isinstance(forward_model,DDP) else forward_model.module.encoder.config
                 config_dict['num_params'] = pytorch_total_params
                 with open(os.path.join(arg.dir, 'config_encoder.json'), 'w') as f:
                     json.dump(config_dict, f, indent = 4)
@@ -374,7 +381,8 @@ def main(rank: int, world_size: int, arg):
             raise NotImplementedError
         if arg.use_ema:
             optimizer = EMA(optimizer, ema_decay=0.9999)
-        if arg.resume is not None:
+
+        if arg.resume is not None and ii==start_residual_number:
             optimizer.load_state_dict(training_state['optimizer_state_dict'])
             print(f"Loaded training state from {arg.resume} at iter {start_iter}")
             del training_state
@@ -389,8 +397,8 @@ def main(rank: int, world_size: int, arg):
                             data_loader = data_loader, iterations = arg.iterations, device = device, start_iter = start_iter,
                             warmup_steps = arg.warmup_steps, dir = arg.dir, learning_rate = arg.learning_rate, independent = arg.independent,
                             samples_test = samples_test, use_ema = arg.use_ema, ema_after_steps = arg.ema_after_steps, sampling_steps = arg.N, world_size=world_size,
-                            weight_prior=arg.weight_prior,T_N=arg.T_N)
-        destroy_process_group()
+                            weight_prior=arg.weight_prior,T_N=arg.T_N,residual_number=ii)
+    destroy_process_group()
 
 if __name__ == "__main__":
     arg = get_args()
