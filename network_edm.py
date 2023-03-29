@@ -136,19 +136,23 @@ class UNetBlock(torch.nn.Module):
         in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
         num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
         resample_filter=[1,1], resample_proj=False, adaptive_scale=True,
-        init=dict(), init_zero=dict(init_weight=0), init_attn=None,
+        init=dict(), init_zero=dict(init_weight=0), init_attn=None,use_dwt=False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.emb_channels = emb_channels
+        self.use_dwt = use_dwt
         self.num_heads = 0 if not attention else num_heads if num_heads is not None else out_channels // channels_per_head
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
-        self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
+        if down and use_dwt:
+            self.conv0 = DWTDown(in_channel=in_channels, out_channel=out_channels)
+        else:
+            self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
         self.affine = Linear(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), **init)
         self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
         self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
@@ -156,7 +160,12 @@ class UNetBlock(torch.nn.Module):
         self.skip = None
         if out_channels != in_channels or up or down:
             kernel = 1 if resample_proj or out_channels!= in_channels else 0
-            self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, **init)
+            if down and use_dwt:
+                self.skip = DWTDown(in_channel=in_channels, out_channel=out_channels)
+            elif up and use_dwt:
+                self.skip = DWTUp(in_channel=in_channels,out_channel=out_channels)
+            else:
+                self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, **init)
 
         if self.num_heads:
             self.norm2 = GroupNorm(num_channels=out_channels, eps=eps)
@@ -719,13 +728,13 @@ class DWTUp(torch.nn.Module):
         self.in_channel = in_channel
         self.out_channel = out_channel
 
-        self.idwt = DWTInverse(J=1, wave='db1', mode='zero')
+        self.idwt = DWTInverse(wave='db1', mode='zero')
         self.soft_mask = torch.nn.Sequential(*[
-            torch.nn.AdpativeAvgPool2d((1,1)),
+            torch.nn.AdaptiveAvgPool2d((1,1)),
             torch.nn.Flatten(),
             torch.nn.Linear(self.in_channel,self.in_channel//4),
             torch.nn.SiLU(inplace=True),
-            torch.nn.Linear(self.in_channel//4,4*self.out_channel),
+            torch.nn.Linear(self.in_channel//4,4),
             torch.nn.Sigmoid(),
         ])
         self.conv = torch.nn.Conv2d(self.in_channel,4*self.out_channel,1,1,0,bias=False)
@@ -735,12 +744,13 @@ class DWTUp(torch.nn.Module):
         LL,LH,HL,HH = torch.chunk(y,4,dim=1)
         soft_mask = self.soft_mask(x)
         LL_mask,LH_mask,HL_mask,HH_mask = torch.chunk(soft_mask,4,dim=1)
-        LL = LL * LL_mask.view(LL.shape[0],LL.shape[1],1,1)
-        LH = LH * LH_mask.view(LH.shape[0],LH.shape[1],1,1)
-        HL = HL * HL_mask.view(HL.shape[0],HL.shape[1],1,1)
-        HH = HH * HH_mask.view(HH.shape[0],HH.shape[1],1,1)
-        all_list = [torch.cat([LH,HL,HH],1)]
-        return self.idwt(LL,all_list)
+        LL = LL * LL_mask.view(LL.shape[0],1,1,1)
+        LH = LH * LH_mask.view(LH.shape[0],1,1,1)
+        HL = HL * HL_mask.view(HL.shape[0],1,1,1)
+        HH = HH * HH_mask.view(HH.shape[0],1,1,1)
+        all_list = [torch.stack([LH,HL,HH],2)]
+        output = self.idwt((LL,all_list))
+        return output
 
 class DWTDown(torch.nn.Module):
     def __init__(self,in_channel,out_channel) -> None:
@@ -750,24 +760,26 @@ class DWTDown(torch.nn.Module):
 
         self.dwt = DWTForward(J=1, wave='db1', mode='zero')
         self.soft_mask = torch.nn.Sequential(*[
-            torch.nn.AdpativeAvgPool2d((1,1)),
+            torch.nn.AdaptiveAvgPool2d((1,1)),
             torch.nn.Flatten(),
             torch.nn.Linear(self.in_channel,self.in_channel//4),
             torch.nn.SiLU(inplace=True),
-            torch.nn.Linear(self.in_channel//4,4*self.in_channel),
+            torch.nn.Linear(self.in_channel//4,4),
             torch.nn.Sigmoid(),
         ])
         self.conv = torch.nn.Conv2d(self.in_channel,self.out_channel,3,1,1,bias=False)
     def forward(self,x):
         LL,all_list = self.dwt(x)
-        LH,HL,HH = torch.chunk(all_list[0],3,1)
+        LH,HL,HH = torch.chunk(all_list[0],3,2)
+        LH,HL,HH = LH.squeeze(2),HL.squeeze(2),HH.squeeze(2)
 
         soft_mask = self.soft_mask(x)
+        # print(soft_mask.shape,LL.shape,x.shape) (64, 1024) torch.Size([64, 256, 16, 16]) torch.Size([64, 256, 32, 32])
         LL_mask,LH_mask,HL_mask,HH_mask = torch.chunk(soft_mask,4,1)
-        LL = LL * LL_mask.view(LL.shape[0],LL.shape[1],1,1)
-        LH = LH * LH_mask.view(LH.shape[0],LH.shape[1],1,1)
-        HL = HL * HL_mask.view(HL.shape[0],HL.shape[1],1,1)
-        HH = HH * HH_mask.view(HH.shape[0],HH.shape[1],1,1)
+        LL = LL * LL_mask.view(LL.shape[0],1,1,1)
+        LH = LH * LH_mask.view(LH.shape[0],1,1,1)
+        HL = HL * HL_mask.view(HL.shape[0],1,1,1)
+        HH = HH * HH_mask.view(HH.shape[0],1,1,1)
         output = LL+LH+HL+HH
         return self.conv(output)
 
@@ -797,12 +809,13 @@ class DWTUNet(torch.nn.Module):
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
         phi                 = 0.5,          # The Skip strength, must in [0.1,0.9]
+        use_dwt             = "True",         # If use DWTUp and DWTDown.
         **kwargs
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
         assert decoder_type in ['standard', 'skip']
-
+        use_dwt = True if use_dwt=="True" else False
         super().__init__()
         self.config = {
             'img_resolution'    : img_resolution,
@@ -827,13 +840,14 @@ class DWTUNet(torch.nn.Module):
         emb_channels = model_channels * channel_mult_emb
         noise_channels = model_channels * channel_mult_noise
         self.phi = phi
+        self.use_dwt = use_dwt
         init = dict(init_mode='xavier_uniform')
         init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
-            init=init, init_zero=init_zero, init_attn=init_attn,
+            init=init, init_zero=init_zero, init_attn=init_attn,use_dwt=use_dwt,
         )
 
         # Mapping.
@@ -841,9 +855,8 @@ class DWTUNet(torch.nn.Module):
         self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init) if label_dim else None
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
         self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
-
-        # self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
-
+        print("Use DWT:",self.use_dwt)
+        print("Phi:",self.phi)
         # Encoder.
         self.enc = torch.nn.ModuleDict()
         cout = in_channels
@@ -857,10 +870,12 @@ class DWTUNet(torch.nn.Module):
             else:
                 self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
                 if encoder_type == 'skip':
-                    self.enc[f'{res}x{res}_aux_down'] = FuseConv(DWTDown(in_channel=caux,out_channel=caux),caux,emb_channels)
+                    self.enc[f'{res}x{res}_aux_down'] = FuseConv(DWTDown(in_channel=caux,out_channel=caux),caux,emb_channels) \
+                        if self.use_dwt else FuseConv(Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter),caux,emb_channels)
                     self.enc[f'{res}x{res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
                 if encoder_type == 'residual':
-                    self.enc[f'{res}x{res}_aux_residual'] = FuseConv(DWTDown(in_channel=caux, out_channel=cout),cout,emb_channels)
+                    self.enc[f'{res}x{res}_aux_residual'] = FuseConv(DWTDown(in_channel=caux, out_channel=cout),cout,emb_channels) if self.use_dwt \
+                        else FuseConv(Conv2d(in_channels=caux, out_channels=cout, kernel=3, down=True, resample_filter=resample_filter, fused_resample=True, **init),cout,emb_channels)
                     caux = cout
             for idx in range(num_blocks):
                 cin = cout
@@ -885,10 +900,10 @@ class DWTUNet(torch.nn.Module):
                 self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
-                    self.dec[f'{res}x{res}_aux_up'] = FuseConv(DWTUp(in_channel=out_channels, out_channel=out_channels),out_channels,emb_channels)
+                    self.dec[f'{res}x{res}_aux_up'] = FuseConv(DWTUp(in_channel=out_channels, out_channel=out_channels),out_channels,emb_channels) if self.use_dwt \
+                                                    else FuseConv(Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter),out_channels,emb_channels)
                 self.dec[f'{res}x{res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
                 self.dec[f'{res}x{res}_aux_conv'] = FuseConv(Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero),out_channels,emb_channels)
-
     def forward(self, x, noise_labels, class_labels = None, augment_labels=None):
         # Mapping.
         emb = self.map_noise(noise_labels)
@@ -926,6 +941,7 @@ class DWTUNet(torch.nn.Module):
         phi = noise_labels * (0.9 - self.phi) + self.phi
         neg_phi = 2 * (1 - phi) # noise_label is 0, neg_phi is 1; noise_label is 1, neg_phi is 0.2
         pos_phi = 2 * phi       # noise_label is 0, pos_phi is 1; noise_label is 1, pos_phi is 1.8
+        # 1 -> dwt 2 -> skip
 
         for name, block in self.dec.items():
             if 'aux_up' in name:
