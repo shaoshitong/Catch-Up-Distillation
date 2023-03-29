@@ -135,3 +135,77 @@ def convert_ddp_state_dict_to_single(ddp_state_dict):
         new_key = key.replace('module.', '') if key.startswith('module.') else key
         single_state_dict[new_key] = value
     return single_state_dict
+def RK(function,value,start,step,step_nums,method="RK45"):
+    if method == "RK67":
+        def rk67_fixed_step(ode, y0, t0, dt, num_steps):
+            y = y0
+            t = t0
+            for _ in range(num_steps):
+                k1 = ode(t, y)
+                k2 = ode(t + dt / 5, y + dt * k1 / 5)
+                k3 = ode(t + 3 * dt / 10, y + 3 * dt * k1 / 40 + 9 * dt * k2 / 40)
+                k4 = ode(t + 4 * dt / 5, y + 44 * dt * k1 / 45 - 56 * dt * k2 / 15 + 32 * dt * k3 / 9)
+                k5 = ode(t + 8 * dt / 9, y + 19372 * dt * k1 / 6561 - 25360 * dt * k2 / 2187 + 64448 * dt * k3 / 6561 - 212 * dt * k4 / 729)
+                k6 = ode(t + dt, y + 9017 * dt * k1 / 3168 - 355 * dt * k2 / 33 + 46732 * dt * k3 / 5247 + 49 * dt * k4 / 176 - 5103 * dt * k5 / 18656)
+                y += dt * (35 * k1 / 384 + 500 * k3 / 1113 + 125 * k4 / 192 - 2187 * k5 / 6784 + 11 * k6 / 84)
+                t += dt
+            return y
+        return rk67_fixed_step(function,value,start,step,step_nums)
+    elif method == "RK45":
+        def rk45_fixed_step(ode, y0, t0, dt, num_steps):
+            y = y0
+            t = t0
+            for _ in range(num_steps):
+                k1 = ode(t, y)
+                k2 = ode(t + dt/2, y + dt * k1/2)
+                k3 = ode(t + dt/2, y + dt * k2/2)
+                k4 = ode(t + dt, y + dt * k3)
+                y += dt * (k1 + 2*k2 + 2*k3 + k4) / 6
+                t += dt
+            return y
+        return rk45_fixed_step(function,value,start,step,step_nums)
+    elif method == "RK23":
+        def rk23_fixed_step(ode, y0, t0, dt, num_steps):
+            y = y0
+            t = t0
+            for _ in range(num_steps):
+                k1 = ode(t, y)
+                k2 = ode(t + dt, y + dt * k1)
+                y += dt * (k1 + k2) / 2
+                t += dt
+            return y
+        return rk23_fixed_step(function,value,start,step,step_nums)
+    else:
+        raise NotImplementedError
+
+class InfiniteDataLoaderIterator:
+    def __init__(self, data_loader):
+        self.data_loader = data_loader
+        self.data_iter = iter(self.data_loader)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            batch = next(self.data_iter)
+        except StopIteration:
+            self.data_iter = iter(self.data_loader)
+            batch = next(self.data_iter)
+        return batch
+    
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+class LPIPS(nn.Module):
+    def __init__(self):
+        super(LPIPS, self).__init__()
+        self.net = models.vgg16(pretrained=True).features[:29]
+        for param in self.net.parameters():
+            param.requires_grad = False
+
+    def forward(self, x, y):
+        x = self.net(x)
+        y = self.net(y)
+        return torch.mean(torch.square(x - y))

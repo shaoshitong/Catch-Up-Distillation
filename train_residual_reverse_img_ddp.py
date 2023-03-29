@@ -73,10 +73,10 @@ def get_args():
 
 
 def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_loader, iterations, device, start_iter, warmup_steps, dir, learning_rate, independent,
-                         ema_after_steps, use_ema, samples_test, sampling_steps, world_size, weight_prior,T_N, residual_number):
+                         ema_after_steps, use_ema, samples_test, sampling_steps, world_size, weight_prior,T_N, residual_number,arg):
     for i in range(len(rectified_flow.model_list)-1):
         rectified_flow.model_list[i].eval()
-    has_iter_residual_number = iterations * (residual_number+1)
+    has_iter_residual_number = arg.iterations * (residual_number+1)
     if rank == 0:
         writer = tensorboardX.SummaryWriter(log_dir=dir)
     samples_test = samples_test.to(device)
@@ -137,7 +137,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             with open(os.path.join(dir, 'log.txt'), 'a') as f:
                 f.write(f"Iteration {i+has_iter_residual_number}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
 
-        if i % 1000 == 1 and rank == 0:
+        if i % 10000 == 1 and rank == 0:
             rectified_flow.model.eval()
             if use_ema:
                 optimizer.swap_parameters_with_ema(store_params_in_ema=True)
@@ -333,11 +333,17 @@ def main(rank: int, world_size: int, arg):
     for ii in range(start_residual_number, arg.residual_number):
 
         if ii != start_residual_number:
+            print("old address:",id(model_list[-1]))
+            optimizer.swap_parameters_with_ema(True)
+            print("new address:",id(model_list[-1]))
             flow_model = model_class(**config_de)
             flow_model = torch.compile(flow_model,backend="inductor")
+            flow_model.load_state_dict(copy.deepcopy(convert_ddp_state_dict_to_single(model_list[-1].state_dict())))
+            now_iteration = arg.iterations//5
             model_list.append(flow_model)
             start_iter = 0
-
+        else:
+            now_iteration = arg.iterations
         if rank == 0:
             # Print the number of parameters in the model
             print(f"start residual training : {ii}")
@@ -394,10 +400,10 @@ def main(rank: int, world_size: int, arg):
         rectified_flow = ResidualFlow(device, model_list, num_steps = arg.N)
 
         train_rectified_flow(rank = rank, rectified_flow = rectified_flow, forward_model = forward_model, optimizer = optimizer,
-                            data_loader = data_loader, iterations = arg.iterations, device = device, start_iter = start_iter,
+                            data_loader = data_loader, iterations = now_iteration, device = device, start_iter = start_iter,
                             warmup_steps = arg.warmup_steps, dir = arg.dir, learning_rate = arg.learning_rate, independent = arg.independent,
                             samples_test = samples_test, use_ema = arg.use_ema, ema_after_steps = arg.ema_after_steps, sampling_steps = arg.N, world_size=world_size,
-                            weight_prior=arg.weight_prior,T_N=arg.T_N,residual_number=ii)
+                            weight_prior=arg.weight_prior,T_N=arg.T_N,residual_number=ii,arg = arg)
     destroy_process_group()
 
 if __name__ == "__main__":

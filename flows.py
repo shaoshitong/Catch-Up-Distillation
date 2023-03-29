@@ -2,6 +2,9 @@ import torch
 from tqdm import tqdm
 from utils import alpha, dalpha_dt, d_1_minus_alpha_sq_dt
 from scipy import integrate
+from dpm_solver_pytorch import DPM_Solver, model_wrapper, NoiseScheduleVP
+from utils import RK
+import functools
 
 class BaseFlow():
   def __init__(self, device, model=None, num_steps=1000):
@@ -202,7 +205,41 @@ class ResidualFlow(RectifiedFlow):
       raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
     target = z1 - z0 
     return z_t, t, target
-
+  
+  def get_eval_dis(self, z0=None, z1=None, t = None, res_number = -1 ,N=2):
+    if t is None:
+      t = torch.randint(0,self.N+1,(z1.shape[0],1),device=self.device).float()/self.N
+    if res_number == -1:
+      z1 = self.sample_residual_ode(z1=z1,N=N)
+    else:
+      tq = lambda x: x
+      if N is None:
+        N = self.N    
+      dt = -1./ N
+      z = z1.detach().clone()
+      batchsize = z.shape[0]
+      for i in range(res_number):
+        for j in tq(reversed(range(1,N+1))):
+          s_t = torch.ones((batchsize,1), device=self.device) * j / N
+          if len(z1.shape) == 2:
+            vt = self.model_list[i](z, s_t)
+          elif len(z1.shape) == 4:
+            vt = self.model_list[i](z, s_t.squeeze())
+          z = z.detach().clone() + vt * dt
+      z1 = z
+    if len(z1.shape) == 2:
+      z_t =  t * z1 + (1.-t) * z0
+    elif len(z1.shape) == 4:
+      z_t =  t.view(-1, 1, 1, 1) * z1 + (1.-t.view(-1, 1, 1, 1)) * z0
+    else:
+      raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
+    target = z1 - z0
+    if res_number!=-1:
+      pred = self.model_list[res_number](z_t,t)
+    else:
+      pred = self.model_list[-1](z_t,t)
+    return pred - target
+  
   @torch.no_grad()
   def sample_ode(self, z0=None, N=None):
     if N == None:
@@ -260,14 +297,16 @@ class ResidualFlow(RectifiedFlow):
     return traj, x0hat_list
 
   @torch.no_grad()
-  def sample_residual_ode(self, z1=None, N=None):
+  def sample_residual_ode(self, z1=None, N=None,end = -1):
     tq = lambda x: x
     if N is None:
       N = self.N    
     dt = -1./ N
     z = z1.detach().clone()
     batchsize = z.shape[0]
-    for i in range(len(self.model_list)-1):
+    if end == -1:
+      end = len(self.model_list)
+    for i in range(end):
       for j in tq(reversed(range(1,N+1))):
         t = torch.ones((batchsize,1), device=self.device) * j / N
         if len(z1.shape) == 2:
@@ -276,4 +315,90 @@ class ResidualFlow(RectifiedFlow):
           vt = self.model_list[i](z, t.squeeze())
         z = z.detach().clone() + vt * dt
     return z
+
+
+  @torch.no_grad()
+  def sample_ode_generative_bbox(self, z1=None, N=None, use_tqdm=True, solver = 'RK45'):
+    dshape = z1.shape
+    device = z1.device
+    check_set = [1,2,4,8,16]
+    assert N in check_set,"N must be one of 1, 2, 4, 8, 16."
+    start = torch.ones(z1.shape[0]).to(z1.device).float()
+    end =  torch.zeros(z1.shape[0]).to(z1.device).float()
+    step = (end - start) / N
+    def ode_func(t, x, i):
+      vec_t = t
+      vt = self.model_list[i](x, vec_t)
+      return vt
+    for i in range(len(self.model_list)):
+      z1 = RK(functools.partial(ode_func,i=i),z1,start,step,N,method=solver)
+    return z1
+
+class ConsistencyFlow(RectifiedFlow):
+  def __init__(self, device, ema_model,model, num_steps=1000,TN=16):
+    self.ema_model = ema_model
+    self.model = model
+    self.N = num_steps
+    self.TN = TN
+    self.device = device
+
+  def get_train_tuple(self, z0=None, z1=None, t = None,eps=1e-2):
+    if t is None:
+      t = torch.rand((z0.shape[0],)).to(z1.device).float()
+      t[t<=(1/self.TN)]=1/self.TN
+    if len(z1.shape) == 2:
+      pre_z_t =  t * z1 + (1.-t) * z0
+    elif len(z1.shape) == 4:
+      t = t.view(-1, 1, 1, 1)
+      pre_z_t =  t * z1 + (1.-t) * z0
+      t = t.view(-1)
+    else:
+      raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
+    
+    with torch.no_grad():
+      now_z_t = pre_z_t - (1/self.TN)*self.ema_model(pre_z_t,t)
+      now_t = t - (1/self.TN)
+    
+    pred_z_t = self.model(pre_z_t,t)
+    with torch.no_grad():
+      gt_z_t = self.ema_model(now_z_t,now_t)
+    return pred_z_t,gt_z_t
   
+
+class OnlineSlimFlow(RectifiedFlow):
+  def __init__(self, device, ema_model,model, num_steps=1000,TN=16):
+    self.ema_model = ema_model
+    self.model = model
+    self.N = num_steps
+    self.TN = TN
+    self.device = device
+
+  def get_train_tuple_one_step(self, z0=None, z1=None, t = None,eps=1e-2):
+    if t is None:
+      t = torch.rand((z0.shape[0],)).to(z1.device).float()
+      t[t<=(1/self.TN)]=1/self.TN
+    if len(z1.shape) == 2:
+      pre_z_t =  t * z1 + (1.-t) * z0
+    elif len(z1.shape) == 4:
+      t = t.view(-1, 1, 1, 1)
+      pre_z_t =  t * z1 + (1.-t) * z0
+      t = t.view(-1)
+    else:
+      raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
+    
+    with torch.no_grad():
+      now_z_t = pre_z_t - (1/self.TN)*self.ema_model(pre_z_t,t)
+      now_t = t - (1/self.TN)
+    
+    pred_z_t = self.model(pre_z_t,t)
+    with torch.no_grad():
+      ema_z_t = self.ema_model(now_z_t,now_t)
+
+    gt_z_t = z1 - z0 
+    return pred_z_t, ema_z_t, gt_z_t
+  
+  def get_train_tuple(self, z0=None, z1=None, t=None, eps=0.00001,pred_step=1):
+    if pred_step==1:
+      return self.get_train_tuple_one_step(z0,z1,t,eps)
+    else:
+      raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")

@@ -16,12 +16,25 @@ This is the codebase for Residual-ODE.
 
 ### Train CIFAR-10
 ```python
- python train_reverse_img_ddp.py --gpu 0,1 --dir ./runs/cifar10-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 128 --iterations 500000 --config_en configs\cifar10_en.json --config_de configs\cifar10_de.json
+python train_residual_reverse_img_ddp.py --N 16 --residual-number 3 --gpu 2,3,4,5 --dir ./runs/cifar10-residual-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 64 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --resume ./runs/cifar10-residual-beta20/training_state_latest.pth
+
+python train_reverse_img_ddp.py --N 16 --gpu 2,3,4,5 --dir ./runs/cifar10-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 64 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --resume ./runs/cifar10-residual-beta20/training_state_latest.pth
  ```
+
+### Generate CIFAR-10
+```python
+python generate_residual.py --gpu 0 --dir ./runs/cifar10-residual-beta20/test/ --N 2 --res 32 --input_nc 3 --num_samples 128 --ckpt ./runs/cifar10-residual-beta20/flow_model_300000_ema.pth --encoder ./runs/cifar10-residual-beta20/forward_model_300000_ema.pth --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --dataset cifar10
+
+python generate.py --gpu 3 --dir ./runs/cifar10-beta20/test_16/ --N 16 --res 32 --input_nc 3 --num_samples 50000 --ckpt ./runs/cifar10-beta20/flow_model_500000_ema.pth --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --dataset cifar10
+ ```
+
+```python
+python eval_residual.py --gpu 0 --dir ./runs/cifar10-residual-beta20/test/ --N 16 --res 32 --input_nc 3 --num_samples 512 --ckpt ./runs/cifar10-residual-beta20/flow_model_300000_ema.pth --encoder ./runs/cifar10-residual-beta20/forward_model_300000_ema.pth --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --dataset cifar10 --eval_mode 111
+```
 
 ### Train MNIST
 ```python
- python train_reverse_img_ddp.py --gpu 0,1 --dir ./runs/mnist-beta20/ --weight_prior 20 --learning_rate 3e-4 --dataset mnist --warmup_steps 8000 --optimizer adam --batchsize 256 --iterations 60000 --config_en configs\mnist_en.json --config_de configs\mnist_de.json
+ python train_reverse_img_ddp.py --gpu 0,1 --dir ./runs/mnist-beta20/ --weight_prior 20 --learning_rate 3e-4 --dataset mnist --warmup_steps 8000 --optimizer adam --batchsize 256 --iterations 60000 --config_en configs/mnist_en.json --config_de configs/mnist_de.json
  ```
 
 
@@ -32,7 +45,7 @@ This is the codebase for Residual-ODE.
 
 ### Generate MNIST
 ```python
- python generate.py --gpu 0 --dir test --N 100 --res 28 --input_nc 1 --num_samples 10 --ckpt D:\ML\learned-flows\runs\reverse\mnist-learned-beta20\flow_model_60000_ema.pth --config_de configs\mnist_de.json 
+python generate.py --gpu 0 --dir test --N 100 --res 28 --input_nc 1 --num_samples 10 --ckpt D:\ML\learned-flows\runs\reverse\mnist-learned-beta20\flow_model_60000_ema.pth --config_de configs\mnist_de.json 
  ```
 
 
@@ -45,7 +58,7 @@ This is the codebase for Residual-ODE.
 
 ### Calcuate FID on cifar10
 ```python
-python fid.py calc --images=runs\reverse\cifar10-learned-beta10-smallE\300000-N128\samples --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
+python fid.py calc --images=runs/ --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
 ```
 
 CIFAR-10 training roughly takes 9 days on 2x1080Ti.

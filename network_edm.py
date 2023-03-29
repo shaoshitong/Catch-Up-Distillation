@@ -202,7 +202,8 @@ class PositionalEmbedding(torch.nn.Module):
         freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
         freqs = (1 / self.max_positions) ** freqs
         x = x.ger(freqs.to(x.dtype))
-        x = torch.cat([x.cos(), x.sin()], dim=1)
+        # print(x.shape,freqs.shape) # [16,16] [16,]
+        x = torch.cat([x.cos(), x.sin()], dim=1) # [16,32]
         return x
 
 #----------------------------------------------------------------------------
@@ -691,3 +692,252 @@ class EDMPrecond(torch.nn.Module):
         return torch.as_tensor(sigma)
 
 #----------------------------------------------------------------------------
+# DWTUNet
+
+
+class FuseConv(torch.nn.Module):
+    def __init__(self,conv,out_channel,embed_channel) -> None:
+        super().__init__()
+        self.conv = conv
+        self.out_channels = out_channel
+        self.embed_channels = embed_channel
+        self.embedding = torch.nn.Sequential(*[
+            torch.nn.Linear(embed_channel,out_channel),
+            torch.nn.SiLU(inplace=True),
+            torch.nn.BatchNorm1d(out_channel)
+        ])
+    
+    def forward(self,x,embed):
+        x = self.conv(x) 
+        x = x + self.embedding(embed).view(x.shape[0],x.shape[1],1,1)
+        return x
+    
+from pytorch_wavelets import DWTForward, DWTInverse
+class DWTUp(torch.nn.Module):
+    def __init__(self,in_channel,out_channel) -> None:
+        super().__init__()
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+
+        self.idwt = DWTInverse(J=1, wave='db1', mode='zero')
+        self.soft_mask = torch.nn.Sequential(*[
+            torch.nn.AdpativeAvgPool2d((1,1)),
+            torch.nn.Flatten(),
+            torch.nn.Linear(self.in_channel,self.in_channel//4),
+            torch.nn.SiLU(inplace=True),
+            torch.nn.Linear(self.in_channel//4,4*self.out_channel),
+            torch.nn.Sigmoid(),
+        ])
+        self.conv = torch.nn.Conv2d(self.in_channel,4*self.out_channel,1,1,0,bias=False)
+    
+    def forward(self,x):
+        y = self.conv(x)
+        LL,LH,HL,HH = torch.chunk(y,4,dim=1)
+        soft_mask = self.soft_mask(x)
+        LL_mask,LH_mask,HL_mask,HH_mask = torch.chunk(soft_mask,4,dim=1)
+        LL = LL * LL_mask.view(LL.shape[0],LL.shape[1],1,1)
+        LH = LH * LH_mask.view(LH.shape[0],LH.shape[1],1,1)
+        HL = HL * HL_mask.view(HL.shape[0],HL.shape[1],1,1)
+        HH = HH * HH_mask.view(HH.shape[0],HH.shape[1],1,1)
+        all_list = [torch.cat([LH,HL,HH],1)]
+        return self.idwt(LL,all_list)
+
+class DWTDown(torch.nn.Module):
+    def __init__(self,in_channel,out_channel) -> None:
+        super().__init__()
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+
+        self.dwt = DWTForward(J=1, wave='db1', mode='zero')
+        self.soft_mask = torch.nn.Sequential(*[
+            torch.nn.AdpativeAvgPool2d((1,1)),
+            torch.nn.Flatten(),
+            torch.nn.Linear(self.in_channel,self.in_channel//4),
+            torch.nn.SiLU(inplace=True),
+            torch.nn.Linear(self.in_channel//4,4*self.in_channel),
+            torch.nn.Sigmoid(),
+        ])
+        self.conv = torch.nn.Conv2d(self.in_channel,self.out_channel,3,1,1,bias=False)
+    def forward(self,x):
+        LL,all_list = self.dwt(x)
+        LH,HL,HH = torch.chunk(all_list[0],3,1)
+
+        soft_mask = self.soft_mask(x)
+        LL_mask,LH_mask,HL_mask,HH_mask = torch.chunk(soft_mask,4,1)
+        LL = LL * LL_mask.view(LL.shape[0],LL.shape[1],1,1)
+        LH = LH * LH_mask.view(LH.shape[0],LH.shape[1],1,1)
+        HL = HL * HL_mask.view(HL.shape[0],HL.shape[1],1,1)
+        HH = HH * HH_mask.view(HH.shape[0],HH.shape[1],1,1)
+        output = LL+LH+HL+HH
+        return self.conv(output)
+
+
+
+
+@persistence.persistent_class
+class DWTUNet(torch.nn.Module):
+    def __init__(self,
+        img_resolution,                     # Image resolution at input/output.
+        in_channels,                        # Number of color channels at input.
+        out_channels,                       # Number of color channels at output.
+        label_dim           = 0,            # Number of class labels, 0 = unconditional.
+        augment_dim         = 0,            # Augmentation label dimensionality, 0 = no augmentation.
+
+        model_channels      = 128,          # Base multiplier for the number of channels.
+        channel_mult        = [1,2,2,2],    # Per-resolution multipliers for the number of channels.
+        channel_mult_emb    = 4,            # Multiplier for the dimensionality of the embedding vector.
+        num_blocks          = 4,            # Number of residual blocks per resolution.
+        attn_resolutions    = [16],         # List of resolutions with self-attention.
+        dropout             = 0.10,         # Dropout probability of intermediate activations.
+        label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+
+        embedding_type      = 'positional', # Timestep embedding type: 'positional' for DDPM++, 'fourier' for NCSN++.
+        channel_mult_noise  = 1,            # Timestep embedding size: 1 for DDPM++, 2 for NCSN++.
+        encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
+        decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
+        resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+        phi                 = 0.5,          # The Skip strength, must in [0.1,0.9]
+        **kwargs
+    ):
+        assert embedding_type in ['fourier', 'positional']
+        assert encoder_type in ['standard', 'skip', 'residual']
+        assert decoder_type in ['standard', 'skip']
+
+        super().__init__()
+        self.config = {
+            'img_resolution'    : img_resolution,
+            'in_channels'       : in_channels,
+            'out_channels'      : out_channels,
+            'label_dim'         : label_dim,
+            'augment_dim'       : augment_dim,
+            'model_channels'    : model_channels,
+            'channel_mult'      : channel_mult,
+            'channel_mult_emb'  : channel_mult_emb,
+            'num_blocks'        : num_blocks,
+            'attn_resolutions'  : attn_resolutions,
+            'dropout'           : dropout,
+            'label_dropout'     : label_dropout,
+            'embedding_type'    : embedding_type,
+            'channel_mult_noise': channel_mult_noise,
+            'encoder_type'      : encoder_type,
+            'decoder_type'      : decoder_type,
+            'resample_filter'   : resample_filter,
+        }
+        self.label_dropout = label_dropout
+        emb_channels = model_channels * channel_mult_emb
+        noise_channels = model_channels * channel_mult_noise
+        self.phi = phi
+        init = dict(init_mode='xavier_uniform')
+        init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
+        init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
+        block_kwargs = dict(
+            emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
+            resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
+            init=init, init_zero=init_zero, init_attn=init_attn,
+        )
+
+        # Mapping.
+        self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
+        self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init) if label_dim else None
+        self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
+        self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
+
+        # self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
+
+        # Encoder.
+        self.enc = torch.nn.ModuleDict()
+        cout = in_channels
+        caux = in_channels
+        for level, mult in enumerate(channel_mult):
+            res = img_resolution >> level
+            if level == 0:
+                cin = cout
+                cout = model_channels
+                self.enc[f'{res}x{res}_conv'] = FuseConv(Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init),cout,emb_channels)
+            else:
+                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                if encoder_type == 'skip':
+                    self.enc[f'{res}x{res}_aux_down'] = FuseConv(DWTDown(in_channel=caux,out_channel=caux),caux,emb_channels)
+                    self.enc[f'{res}x{res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
+                if encoder_type == 'residual':
+                    self.enc[f'{res}x{res}_aux_residual'] = FuseConv(DWTDown(in_channel=caux, out_channel=cout),cout,emb_channels)
+                    caux = cout
+            for idx in range(num_blocks):
+                cin = cout
+                cout = model_channels * mult
+                attn = (res in attn_resolutions)
+                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+        skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
+
+        # Decoder.
+        self.dec = torch.nn.ModuleDict()
+        for level, mult in reversed(list(enumerate(channel_mult))):
+            res = img_resolution >> level
+            if level == len(channel_mult) - 1:
+                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
+                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+            else:
+                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+            for idx in range(num_blocks + 1):
+                cin = cout + skips.pop()
+                cout = model_channels * mult
+                attn = (idx == num_blocks and res in attn_resolutions)
+                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+            if decoder_type == 'skip' or level == 0:
+                if decoder_type == 'skip' and level < len(channel_mult) - 1:
+                    self.dec[f'{res}x{res}_aux_up'] = FuseConv(DWTUp(in_channel=out_channels, out_channel=out_channels),out_channels,emb_channels)
+                self.dec[f'{res}x{res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
+                self.dec[f'{res}x{res}_aux_conv'] = FuseConv(Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero),out_channels,emb_channels)
+
+    def forward(self, x, noise_labels, class_labels = None, augment_labels=None):
+        # Mapping.
+        emb = self.map_noise(noise_labels)
+        emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
+        if self.map_label is not None:
+            tmp = class_labels
+            if self.training and self.label_dropout:
+                tmp = tmp * (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
+            emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+        if self.map_augment is not None and augment_labels is not None:
+            emb = emb + self.map_augment(augment_labels)
+        emb = silu(self.map_layer0(emb))
+
+        # Noise Embedding
+
+
+        # Encoder.
+        skips = []
+        aux = x
+        for name, block in self.enc.items():
+            if 'aux_down' in name:
+                aux = block(aux,emb)
+            elif 'aux_skip' in name:
+                x = skips[-1] = x + block(aux)
+            elif 'aux_residual' in name:
+                x = skips[-1] = aux = (x + block(aux,emb)) / np.sqrt(2)
+            else:
+                x = block(x, emb) if isinstance(block, UNetBlock) else block(x,emb)
+                skips.append(x)
+
+        # Decoder.
+        aux = None
+        tmp = None
+
+        phi = noise_labels * (0.9 - self.phi) + self.phi
+        neg_phi = 2 * (1 - phi) # noise_label is 0, neg_phi is 1; noise_label is 1, neg_phi is 0.2
+        pos_phi = 2 * phi       # noise_label is 0, pos_phi is 1; noise_label is 1, pos_phi is 1.8
+
+        for name, block in self.dec.items():
+            if 'aux_up' in name:
+                aux = block(aux,emb)
+            elif 'aux_norm' in name:
+                tmp = block(x)
+            elif 'aux_conv' in name:
+                tmp = block(tmp,emb)
+                aux = tmp if aux is None else tmp + aux
+            else:
+                if x.shape[1] != block.in_channels:
+                    x = torch.cat([x*pos_phi.view(-1,1,1,1), skips.pop()*neg_phi.view(-1,1,1,1)], dim=1)
+                x = block(x, emb)
+        return aux
+

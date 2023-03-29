@@ -2,7 +2,7 @@
 
 import torch
 import numpy as np
-from flows import RectifiedFlow,ResidualFlow
+from flows import ResidualFlow
 import torch.nn as nn
 import tensorboardX
 import os
@@ -11,13 +11,14 @@ from guided_diffusion.unet import UNetModel
 import torchvision.datasets as dsets
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
-from utils import straightness,convert_ddp_state_dict_to_single
+from utils import straightness
 from dataset import CelebAHQImgDataset
 import argparse
 from tqdm import tqdm
 from network_edm import SongUNet
 from torch.nn import DataParallel
-import json
+import json,copy
+from utils import convert_ddp_state_dict_to_single,InfiniteDataLoaderIterator
 from train_reverse_img_ddp import parse_config
 
 def get_args():
@@ -29,9 +30,11 @@ def get_args():
     parser.add_argument('--batchsize', type=int, default = 4, help='Batch size')
     parser.add_argument('--res', type=int, default = 64, help='Image resolution')
     parser.add_argument('--input_nc', type=int, default = 3, help='Unet num_channels')
-    parser.add_argument('--N', type=int, default = 20, help='Number of sampling steps')
+    parser.add_argument('--N', type=int, default = 4, help='Number of sampling steps')
     parser.add_argument('--num_samples', type=int, default = 64, help='Number of samples to generate')
-    parser.add_argument('--encoder', type=str, default = None, help='Encoder ckpt')
+    parser.add_argument('--encoder', type=str, default=None,  help='If Use Encoder')
+    parser.add_argument('--residual-number', type=int, default=-1, help='the residual number of model used in sampling, \
+                         -1 represents using all residual ode diffusion model.')
     parser.add_argument('--dataset', type=str, help='cifar10 / mnist / celebahq')
     parser.add_argument('--no_scale', action='store_true', help='Store true if the model is trained on [0,1] scale')    
     parser.add_argument('--save_traj', action='store_true', help='Save the trajectories')    
@@ -50,21 +53,19 @@ def get_args():
     return arg
 
 def main(arg):
-
+    arg.dir = os.path.join(arg.dir,  f"residual_number_{arg.residual_number}")
     if not os.path.exists(arg.dir):
         os.makedirs(arg.dir)
     assert arg.config_de is not None
     config = parse_config(arg.config_de)
-
-
-    if not os.path.exists(os.path.join(arg.dir, "samples")):
-        os.makedirs(os.path.join(arg.dir, "samples"))
-    if not os.path.exists(os.path.join(arg.dir, "zs")):
-        os.makedirs(os.path.join(arg.dir, "zs"))
-    if not os.path.exists(os.path.join(arg.dir, "trajs")):
-        os.makedirs(os.path.join(arg.dir, "trajs"))
-    if not os.path.exists(os.path.join(arg.dir, "data")):
-        os.makedirs(os.path.join(arg.dir, "data"))
+    if not os.path.exists(os.path.join(arg.dir, f"samples")):
+        os.makedirs(os.path.join(arg.dir, f"samples"))
+    if not os.path.exists(os.path.join(arg.dir, f"zs")):
+        os.makedirs(os.path.join(arg.dir, f"zs"))
+    if not os.path.exists(os.path.join(arg.dir, f"trajs")):
+        os.makedirs(os.path.join(arg.dir, f"trajs"))
+    if not os.path.exists(os.path.join(arg.dir, f"data")):
+        os.makedirs(os.path.join(arg.dir, f"data"))
     
 
 
@@ -76,33 +77,38 @@ def main(arg):
     flow_model = model_class(**config)
     flow_model = torch.compile(flow_model,backend="inductor")
     device_ids = arg.gpu.split(',')
+    model_list = []
     if arg.ckpt is not None:
-        flow_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.ckpt, map_location = "cpu")))
+        flow_training_state = torch.load(arg.ckpt,map_location="cpu")
+        if arg.residual_number == -1:
+            arg.residual_number = len(flow_training_state)
+        for ii in range(min(len(flow_training_state),arg.residual_number)):
+            sub_flow_model = copy.deepcopy(flow_model)
+            sub_flow_model.load_state_dict(convert_ddp_state_dict_to_single(flow_training_state[ii]))
+            model_list.append(sub_flow_model)
     else:
         raise NotImplementedError("Model ckpt should be provided.")
     if len(device_ids) > 1:
         device = torch.device(f"cuda")
         print(f"Using {device_ids} GPUs!")
-        flow_model = DataParallel(flow_model)
+        for ii in range(len(model_list)):
+            model_list[ii] = DataParallel(model_list[ii])
     else:
         device = torch.device(f"cuda")
         print(f"Using GPU {arg.gpu}!")
     # Print the number of parameters in the model
-    pytorch_total_params = sum(p.numel() for p in flow_model.parameters())
+    pytorch_total_params = sum(sum(p.numel() for p in sub_flow_model.parameters()) for sub_flow_model in model_list)
     # Convert to M
     pytorch_total_params = pytorch_total_params / 1000000
     print(f"Total number of parameters: {pytorch_total_params}M")
-
-    
-    flow_model = flow_model.to(device)
-
-
-    rectified_flow = RectifiedFlow(device, flow_model, num_steps = arg.N)
-
-    rectified_flow.model.eval()
+    for ii in range(len(model_list)):
+        model_list[ii] = model_list[ii].to(device)
+    rectified_flow = ResidualFlow(device, model_list, num_steps = arg.N)
+    for sub_flow_model in rectified_flow.model_list:
+        sub_flow_model.eval()
 
     if arg.encoder is not None:
-        from train_reverse_img_ddp import get_loader
+        from train_residual_reverse_img_ddp import get_loader
         config_en = parse_config(arg.config_en)
         if config_en['unet_type'] == 'adm':
             encoder_class = UNetModel
@@ -111,16 +117,12 @@ def main(arg):
         # Pass the arguments in the config file to the model
         encoder = encoder_class(**config_en)
         # encoder = SongUNet(img_resolution = arg.res, in_channels = arg.input_nc, out_channels = arg.input_nc * 2, channel_mult = [2,2,2], dropout = 0.13, num_blocks = 2, model_channels = 32)
-        
         forward_model = UNetEncoder(encoder = encoder, input_nc = arg.input_nc)
-        forward_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.encoder, map_location = "cpu"), strict = True))
-      
-        
+        forward_model = torch.compile(forward_model,backend="inductor")
+        forward_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.encoder,map_location='cpu')), strict = True)
         forward_model = forward_model.to(device).eval()
         data_loader, _, _, _ = get_loader(arg.dataset, arg.batchsize, 1, 0)
-        # dataset_train = CelebAHQImgDataset(arg.res, im_dir = 'D:\datasets\CelebAMask-HQ\CelebA-HQ-img-train-64')
-        # dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=arg.batchsize)
-        train_iter = iter(data_loader)
+        train_iter = InfiniteDataLoaderIterator(data_loader)
     # Save configs as json file
     config_dict = vars(arg)
     with open(os.path.join(arg.dir, 'config_sampling.json'), 'w') as f:
@@ -153,12 +155,10 @@ def main(arg):
                 uncond_straightness = straightness(traj_uncond)
                 straightness_list.append(uncond_straightness.item())
             else:
-                x0, nfe = rectified_flow.sample_ode_generative_bbox(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver, atol = arg.atol, rtol = arg.rtol)
-                nfes.append(nfe)
-                # print(f"nfe: {nfe}")
+                x0 = rectified_flow.sample_ode_generative_bbox(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver)
 
             if arg.save_traj:
-                if len(traj_uncond_x0) > 10:
+                if len(traj_uncond_x0) > 20:
                     interval = len(traj_uncond_x0) // 5
                     grid = torch.cat(traj_uncond_x0[::interval], dim=3)
                 else:
