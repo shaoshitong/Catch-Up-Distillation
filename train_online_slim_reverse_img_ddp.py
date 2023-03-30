@@ -64,7 +64,7 @@ def get_args():
     parser.add_argument('--N', type=int, default = 16, help='Number of sampling steps')
     parser.add_argument('--num_samples', type=int, default = 64, help='Number of samples to generate')
     parser.add_argument('--no_ema', action='store_true', help='use EMA or not')
-    parser.add_argument('--l_weight',type=list, default=[0.,1.],nargs='+', action='append', help='List of numbers')
+    parser.add_argument('--l_weight',type=list, default=[1.,1.],nargs='+', action='append', help='List of numbers')
     parser.add_argument('--ema_after_steps', type=int, default = 1, help='Apply EMA after steps')
     parser.add_argument('--optimizer', type=str, default = 'adamw', help='adam / adamw')
     parser.add_argument('--warmup_steps', type=int, default = 0, help='Learning rate warmup')
@@ -108,8 +108,9 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             loss_prior = get_kl(mu, logvar)
         pred_z_t,ema_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
         # Learn reverse model
-        # loss_fm = (i/iterations) * arg.l_weight[0] * criticion(pred_z_t , ema_z_t) + (1-i/iterations) * arg.l_weight[1] * torch.nn.functional.mse_loss(pred_z_t , gt_z_t,reduction="mean")
-        loss_fm = arg.l_weight[0] * criticion(pred_z_t , ema_z_t) + arg.l_weight[1] * torch.nn.functional.mse_loss(pred_z_t , gt_z_t,reduction="mean")
+        loss_fm = arg.l_weight[1] * torch.nn.functional.mse_loss(pred_z_t , gt_z_t,reduction="mean")
+        #  (i/iterations) * arg.l_weight[0] * criticion(pred_z_t , ema_z_t) + 
+        # loss_fm = arg.l_weight[0] * criticion(pred_z_t , ema_z_t) + arg.l_weight[1] * torch.nn.functional.mse_loss(pred_z_t , gt_z_t,reduction="mean")
         loss_fm = loss_fm.mean()
         loss = loss_fm + weight_prior * loss_prior
         loss.backward()

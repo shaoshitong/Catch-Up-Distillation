@@ -1,7 +1,7 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
-python train_reverse_img_ddp.py --gpu 0,1 --dir ./runs/cifar10-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 128 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json
+python train_reverse_img_ddp.py --gpu 4,5,6,7 --dir ./runs/cifar10-2-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 64 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json
 """
 import torch
 import numpy as np
@@ -26,6 +26,7 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch._dynamo.backends.distributed import DDPOptimizer
 
 torch.manual_seed(0)
 
@@ -357,10 +358,17 @@ def main(rank: int, world_size: int, arg):
         print(f"Loaded training state from {arg.resume} at iter {start_iter}")
     
     # DDP
-    flow_model = DDP(flow_model, device_ids=[rank])
+    flow_model = DDP(torch.compile(flow_model,mode="max-autotune"),device_ids=[rank])
+
+    # ddp_optimizer = DDPOptimizer(bucket_bytes_cap=flow_model.bucket_bytes_cap,backend_compile_fn=lambda x: torch.compile(x, backend="inductor"))
+    # fx_flow_model = torch.fx.symbolic_trace(flow_model,concrete_args =dict( x = torch.randn(64,3,32,32).to(device), noise_labels=torch.randn(64,).to(device),class_labels = None, augment_labels=None))
+    # flow_model = ddp_optimizer.compile_fn(fx_flow_model,[torch.rand(64,3,32,32).to(device),torch.rand(64).to(device)])
+
+
     if forward_model is not None:
         forward_model = DDP(forward_model, device_ids=[rank])
-    rectified_flow = RectifiedFlow(device, flow_model, num_steps = arg.N)
+        # forward_model = forward_model
+    rectified_flow = RectifiedFlow(device, flow_model, ema_model=flow_model, num_steps = arg.N)
 
     train_rectified_flow(rank = rank, rectified_flow = rectified_flow, forward_model = forward_model, optimizer = optimizer,
                         data_loader = data_loader, iterations = arg.iterations, device = device, start_iter = start_iter,

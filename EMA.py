@@ -109,10 +109,12 @@ class EMAMODEL(object):
     
     @torch.no_grad()
     def ema_swap(self,model=None):
+        # print('Begin swap',list(self.ema_model.parameters())[0].data[0,0],list(model.parameters())[0].data[0,0])
         for param,ema_param in zip(self.ema_model.parameters(),model.parameters()):
             tmp = param.data.detach()
             param.data = ema_param.detach()
             ema_param.data = tmp
+        # print('After swap',list(self.ema_model.parameters())[0].data[0,0],list(model.parameters())[0].data[0,0])
     
     @torch.no_grad()
     def __call__(self, pre_z_t,t):

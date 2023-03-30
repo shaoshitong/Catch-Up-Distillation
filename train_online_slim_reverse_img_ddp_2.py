@@ -4,10 +4,12 @@
 python train_consistency_reverse_img_ddp.py --N 16 --gpu 4,5,6,7 --dir ./runs/cifar10-consistency2-beta20/ \
 --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 64 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json \
  --pretrain ./runs/cifar10-beta20/flow_model_500000_ema.pth --preforward ./runs/cifar10-beta20/forward_model_500000_ema.pth --loss_type lpips
+
+python train_online_slim_reverse_img_ddp_2.py  --N 16 --gpu 0,1,2,3,4,5,6,7 --dir ./runs/cifar10-onlineslim-3-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 32 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type lpips
 """
 import torch
 import numpy as np
-from flows import ConsistencyFlow
+from flows import ConsistencyFlow,OnlineSlimFlow,RectifiedFlow
 import torch.nn as nn
 import tensorboardX
 import os,copy
@@ -22,7 +24,7 @@ import argparse
 from tqdm import tqdm
 import json 
 from EMA import EMA,EMAMODEL
-from network_edm import SongUNet
+from network_edm import SongUNet,DWTUNet
 # DDP
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
@@ -38,7 +40,7 @@ def ddp_setup(rank, world_size):
         world_size: Total number of processes
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12358"
+    os.environ["MASTER_PORT"] = "12350"
     # Windows
     # init_process_group(backend="gloo", rank=rank, world_size=world_size)
     # Linux
@@ -58,9 +60,11 @@ def get_args():
     parser.add_argument('--resume', type=str, default = None, help='Training state path')
     parser.add_argument('--pretrain', type=str, default = None, help='Pretrain model state path')
     parser.add_argument('--preforward', type=str, default = None, help='Pretrain forward state path')
+    parser.add_argument('--pred_step', type=int, default = 1, help='Predict step')
     parser.add_argument('--N', type=int, default = 16, help='Number of sampling steps')
     parser.add_argument('--num_samples', type=int, default = 64, help='Number of samples to generate')
     parser.add_argument('--no_ema', action='store_true', help='use EMA or not')
+    parser.add_argument('--l_weight',type=list, default=[1.,1.],nargs='+', action='append', help='List of numbers')
     parser.add_argument('--ema_after_steps', type=int, default = 1, help='Apply EMA after steps')
     parser.add_argument('--optimizer', type=str, default = 'adamw', help='adam / adamw')
     parser.add_argument('--warmup_steps', type=int, default = 0, help='Learning rate warmup')
@@ -80,6 +84,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
                          ema_after_steps, use_ema, samples_test, sampling_steps, world_size, weight_prior,T_N,arg):
     if rank == 0:
         writer = tensorboardX.SummaryWriter(log_dir=dir)
+    torch.manual_seed(34+rank)
     samples_test = samples_test.to(device)
     # use tqdm if rank == 0
     tqdm_ = tqdm if rank == 0 else lambda x: x
@@ -102,9 +107,12 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         else:
             z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
             loss_prior = get_kl(mu, logvar)
-        pred_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z)
+        # pred_z_t,ema_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
+        z_t,t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z)
+        pred_z_t = rectified_flow.model(z_t,t)
         # Learn reverse model
-        loss_fm = criticion(pred_z_t , gt_z_t)
+        # loss_fm = (i/iterations) * arg.l_weight[0] * criticion(pred_z_t , ema_z_t) + (1-i/iterations) * arg.l_weight[1] * torch.nn.functional.mse_loss(pred_z_t , gt_z_t,reduction="mean")
+        loss_fm = arg.l_weight[1] *  torch.mean((pred_z_t - gt_z_t)**2)
         loss_fm = loss_fm.mean()
         loss = loss_fm + weight_prior * loss_prior
         loss.backward()
@@ -126,7 +134,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             with open(os.path.join(dir, 'log.txt'), 'a') as f:
                 f.write(f"Iteration {i}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
 
-        if i % 10000 == 1 and rank == 0:
+        if i % 1000 == 1 and rank == 0:
             rectified_flow.model.eval()
             if use_ema:
                 rectified_flow.ema_model.ema_swap(rectified_flow.model)
@@ -277,6 +285,9 @@ def main(rank: int, world_size: int, arg):
             model_class = UNetModel
         elif config_en['unet_type'] == 'songunet':
             model_class = SongUNet
+        elif config_en['unet_type'] == 'dwtunet':
+            model_class = DWTUNet
+
         # Pass the arguments in the config file to the model
         encoder = model_class(**config_en)
         forward_model = UNetEncoder(encoder = encoder, input_nc = input_nc)
@@ -284,16 +295,20 @@ def main(rank: int, world_size: int, arg):
         forward_model = None
     # forward_model = torch.compile(forward_model,backend="inductor")
 
-    assert arg.pretrain is not None, "Please specify the pretrain model path"
-    pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
+    if arg.pretrain is not None:
+        pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
+
+    if config_de['unet_type'] == 'adm':
+        model_class = UNetModel
+    elif config_de['unet_type'] == 'songunet':
+        model_class = SongUNet
+    elif config_de['unet_type'] == 'dwtunet':
+        model_class = DWTUNet
 
     if arg.resume is not None:
         training_state = torch.load(arg.resume, map_location = 'cpu')
         start_iter = training_state['iter']
-        if config_de['unet_type'] == 'adm':
-            model_class = UNetModel
-        elif config_de['unet_type'] == 'songunet':
-            model_class = SongUNet
+
         flow_model = model_class(**config_de)
         # flow_model = torch.compile(flow_model,backend="inductor")
         flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][1]))
@@ -304,14 +319,16 @@ def main(rank: int, world_size: int, arg):
         start_iter = 0
         flow_model = model_class(**config_de)
         # flow_model = torch.compile(flow_model,backend="inductor")
-        flow_model.load_state_dict(convert_ddp_state_dict_to_single(pretrain_state))
-        print("Successfully Load Pretrained Flow Model!")
+        if arg.pretrain is not None:
+            flow_model.load_state_dict(convert_ddp_state_dict_to_single(pretrain_state))
+            print("Successfully Load Pretrained Flow Model!")
         now_iteration = arg.iterations
         if forward_model is not None:
             if arg.preforward is not None:
                 preforward_state = torch.load(arg.preforward, map_location = 'cpu')
                 forward_model.load_state_dict(convert_ddp_state_dict_to_single(preforward_state))
                 print("Successfully Load Pretrained Forward Model!")
+
     if rank == 0:
         # Print the number of parameters in the model
         print("Begin consistency model training")
@@ -342,7 +359,7 @@ def main(rank: int, world_size: int, arg):
         forward_model = DDP(forward_model, device_ids=[rank])
     flow_model = flow_model.to(device)
     flow_model = DDP(flow_model, device_ids=[rank])
-    torch._dynamo.config.suppress_errors = True
+    # torch._dynamo.config.suppress_errors = True
     # learnable parameters: forward model and flow model if flow model is not none
     learnable_params = []
     if forward_model is not None:
@@ -358,8 +375,9 @@ def main(rank: int, world_size: int, arg):
         ema_model = EMAMODEL(model=flow_model)
         if arg.resume is not None:
             ema_model.ema_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][0]))
-    rectified_flow = ConsistencyFlow(device, flow_model, ema_model, num_steps = arg.N)
-
+    rectified_flow = RectifiedFlow(device, flow_model, ema_model, num_steps = arg.N)
+    torch._dynamo.config.suppress_errors = True
+    # rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, num_steps = arg.N)
     train_rectified_flow(rank = rank, rectified_flow = rectified_flow, forward_model = forward_model, optimizer = optimizer,
                         data_loader = data_loader, iterations = now_iteration, device = device, start_iter = start_iter,
                         warmup_steps = arg.warmup_steps, dir = arg.dir, learning_rate = arg.learning_rate, independent = arg.independent,

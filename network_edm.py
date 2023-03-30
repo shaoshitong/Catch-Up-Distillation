@@ -26,7 +26,7 @@ def weight_init(shape, mode, fan_in, fan_out):
 #----------------------------------------------------------------------------
 # Fully-connected layer.
 
-@persistence.persistent_class
+
 class Linear(torch.nn.Module):
     def __init__(self, in_features, out_features, bias=True, init_mode='kaiming_normal', init_weight=1, init_bias=0):
         super().__init__()
@@ -45,7 +45,7 @@ class Linear(torch.nn.Module):
 #----------------------------------------------------------------------------
 # Convolutional layer with optional up/downsampling.
 
-@persistence.persistent_class
+
 class Conv2d(torch.nn.Module):
     def __init__(self,
         in_channels, out_channels, kernel, bias=True, up=False, down=False,
@@ -92,7 +92,7 @@ class Conv2d(torch.nn.Module):
 #----------------------------------------------------------------------------
 # Group normalization.
 
-@persistence.persistent_class
+
 class GroupNorm(torch.nn.Module):
     def __init__(self, num_channels, num_groups=32, min_channels_per_group=4, eps=1e-5):
         super().__init__()
@@ -130,7 +130,8 @@ class AttentionOp(torch.autograd.Function):
 # Represents the union of all features employed by the DDPM++, NCSN++, and
 # ADM architectures.
 
-@persistence.persistent_class
+
+
 class UNetBlock(torch.nn.Module):
     def __init__(self,
         in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
@@ -171,6 +172,7 @@ class UNetBlock(torch.nn.Module):
             self.norm2 = GroupNorm(num_channels=out_channels, eps=eps)
             self.qkv = Conv2d(in_channels=out_channels, out_channels=out_channels*3, kernel=1, **(init_attn if init_attn is not None else init))
             self.proj = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=1, **init_zero)
+    
 
     def forward(self, x, emb):
         orig = x
@@ -195,10 +197,12 @@ class UNetBlock(torch.nn.Module):
             x = x * self.skip_scale
         return x
 
+
+COMPILE_UNETBLOCK = lambda *args, **kwargs: torch.compile(UNetBlock(*args, **kwargs),fullgraph=True,mode="max-autotune")
 #----------------------------------------------------------------------------
 # Timestep embedding used in the DDPM++ and ADM architectures.
 
-@persistence.persistent_class
+
 class PositionalEmbedding(torch.nn.Module):
     def __init__(self, num_channels, max_positions=10000, endpoint=False):
         super().__init__()
@@ -218,7 +222,7 @@ class PositionalEmbedding(torch.nn.Module):
 #----------------------------------------------------------------------------
 # Timestep embedding used in the NCSN++ architecture.
 
-@persistence.persistent_class
+
 class FourierEmbedding(torch.nn.Module):
     def __init__(self, num_channels, scale=16):
         super().__init__()
@@ -235,7 +239,7 @@ class FourierEmbedding(torch.nn.Module):
 # Equations". Equivalent to the original implementation by Song et al.,
 # available at https://github.com/yang-song/score_sde_pytorch
 
-@persistence.persistent_class
+
 class SongUNet(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution at input/output.
@@ -313,7 +317,7 @@ class SongUNet(torch.nn.Module):
                 cout = model_channels
                 self.enc[f'{res}x{res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                self.enc[f'{res}x{res}_down'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
                 if encoder_type == 'skip':
                     self.enc[f'{res}x{res}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter)
                     self.enc[f'{res}x{res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
@@ -324,23 +328,23 @@ class SongUNet(torch.nn.Module):
                 cin = cout
                 cout = model_channels * mult
                 attn = (res in attn_resolutions)
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                self.enc[f'{res}x{res}_block{idx}'] = COMPILE_UNETBLOCK(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
         skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
-
+        self.skips = skips
         # Decoder.
         self.dec = torch.nn.ModuleDict()
         for level, mult in reversed(list(enumerate(channel_mult))):
             res = img_resolution >> level
             if level == len(channel_mult) - 1:
-                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                self.dec[f'{res}x{res}_in0'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
+                self.dec[f'{res}x{res}_in1'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
-                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                self.dec[f'{res}x{res}_up'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
                 attn = (idx == num_blocks and res in attn_resolutions)
-                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                self.dec[f'{res}x{res}_block{idx}'] = COMPILE_UNETBLOCK(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
                     self.dec[f'{res}x{res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter)
@@ -372,10 +376,10 @@ class SongUNet(torch.nn.Module):
             elif 'aux_residual' in name:
                 x = skips[-1] = aux = (x + block(aux)) / np.sqrt(2)
             else:
-                x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+                x = block(x, emb) if isinstance(block, torch._dynamo.eval_frame.OptimizedModule) and isinstance(block._orig_mod,UNetBlock) else block(x)
                 skips.append(x)
 
-        # Decoder.
+        # # Decoder.
         aux = None
         tmp = None
         for name, block in self.dec.items():
@@ -387,7 +391,7 @@ class SongUNet(torch.nn.Module):
                 tmp = block(silu(tmp))
                 aux = tmp if aux is None else tmp + aux
             else:
-                if x.shape[1] != block.in_channels:
+                if 'block' in name:
                     x = torch.cat([x, skips.pop()], dim=1)
                 x = block(x, emb)
         return aux
@@ -398,7 +402,7 @@ class SongUNet(torch.nn.Module):
 # original implementation by Dhariwal and Nichol, available at
 # https://github.com/openai/guided-diffusion
 
-@persistence.persistent_class
+
 class DhariwalUNet(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution at input/output.
@@ -439,11 +443,11 @@ class DhariwalUNet(torch.nn.Module):
                 cout = model_channels * mult
                 self.enc[f'{res}x{res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                self.enc[f'{res}x{res}_down'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
             for idx in range(num_blocks):
                 cin = cout
                 cout = model_channels * mult
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
+                self.enc[f'{res}x{res}_block{idx}'] = COMPILE_UNETBLOCK(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
         skips = [block.out_channels for block in self.enc.values()]
 
         # Decoder.
@@ -451,14 +455,14 @@ class DhariwalUNet(torch.nn.Module):
         for level, mult in reversed(list(enumerate(channel_mult))):
             res = img_resolution >> level
             if level == len(channel_mult) - 1:
-                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                self.dec[f'{res}x{res}_in0'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
+                self.dec[f'{res}x{res}_in1'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
-                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                self.dec[f'{res}x{res}_up'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
-                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
+                self.dec[f'{res}x{res}_block{idx}'] = COMPILE_UNETBLOCK(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
@@ -479,7 +483,7 @@ class DhariwalUNet(torch.nn.Module):
         # Encoder.
         skips = []
         for block in self.enc.values():
-            x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+            x = block(x, emb) if isinstance(block, COMPILE_UNETBLOCK) else block(x)
             skips.append(x)
 
         # Decoder.
@@ -495,7 +499,7 @@ class DhariwalUNet(torch.nn.Module):
 # from the paper "Score-Based Generative Modeling through Stochastic
 # Differential Equations".
 
-@persistence.persistent_class
+
 class VPPrecond(torch.nn.Module):
     def __init__(self,
         img_resolution,                 # Image resolution.
@@ -554,7 +558,7 @@ class VPPrecond(torch.nn.Module):
 # from the paper "Score-Based Generative Modeling through Stochastic
 # Differential Equations".
 
-@persistence.persistent_class
+
 class VEPrecond(torch.nn.Module):
     def __init__(self,
         img_resolution,                 # Image resolution.
@@ -598,7 +602,7 @@ class VEPrecond(torch.nn.Module):
 # Preconditioning corresponding to improved DDPM (iDDPM) formulation from
 # the paper "Improved Denoising Diffusion Probabilistic Models".
 
-@persistence.persistent_class
+
 class iDDPMPrecond(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution.
@@ -658,7 +662,7 @@ class iDDPMPrecond(torch.nn.Module):
 # Improved preconditioning proposed in the paper "Elucidating the Design
 # Space of Diffusion-Based Generative Models" (EDM).
 
-@persistence.persistent_class
+
 class EDMPrecond(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution.
@@ -705,20 +709,19 @@ class EDMPrecond(torch.nn.Module):
 
 
 class FuseConv(torch.nn.Module):
-    def __init__(self,conv,out_channel,embed_channel) -> None:
+    def __init__(self,conv,out_channel,in_channel,embed_channel) -> None:
         super().__init__()
         self.conv = conv
         self.out_channels = out_channel
         self.embed_channels = embed_channel
         self.embedding = torch.nn.Sequential(*[
-            torch.nn.Linear(embed_channel,out_channel),
+            torch.nn.Linear(embed_channel,in_channel),
             torch.nn.SiLU(inplace=True),
-            torch.nn.BatchNorm1d(out_channel)
         ])
     
     def forward(self,x,embed):
-        x = self.conv(x) 
-        x = x + self.embedding(embed).view(x.shape[0],x.shape[1],1,1)
+        embed = self.embedding(embed).view(x.shape[0],x.shape[1],1,1)
+        x = self.conv(x+embed) 
         return x
     
 from pytorch_wavelets import DWTForward, DWTInverse
@@ -734,7 +737,7 @@ class DWTUp(torch.nn.Module):
             torch.nn.Flatten(),
             torch.nn.Linear(self.in_channel,self.in_channel//4),
             torch.nn.SiLU(inplace=True),
-            torch.nn.Linear(self.in_channel//4,4),
+            torch.nn.Linear(self.in_channel//4,4*self.out_channel),
             torch.nn.Sigmoid(),
         ])
         self.conv = torch.nn.Conv2d(self.in_channel,4*self.out_channel,1,1,0,bias=False)
@@ -744,10 +747,10 @@ class DWTUp(torch.nn.Module):
         LL,LH,HL,HH = torch.chunk(y,4,dim=1)
         soft_mask = self.soft_mask(x)
         LL_mask,LH_mask,HL_mask,HH_mask = torch.chunk(soft_mask,4,dim=1)
-        LL = LL * LL_mask.view(LL.shape[0],1,1,1)
-        LH = LH * LH_mask.view(LH.shape[0],1,1,1)
-        HL = HL * HL_mask.view(HL.shape[0],1,1,1)
-        HH = HH * HH_mask.view(HH.shape[0],1,1,1)
+        LL = LL * LL_mask.view(LL.shape[0],LL.shape[1],1,1)
+        LH = LH * LH_mask.view(LH.shape[0],LH.shape[1],1,1)
+        HL = HL * HL_mask.view(HL.shape[0],HL.shape[1],1,1)
+        HH = HH * HH_mask.view(HH.shape[0],HH.shape[1],1,1)
         all_list = [torch.stack([LH,HL,HH],2)]
         output = self.idwt((LL,all_list))
         return output
@@ -764,7 +767,7 @@ class DWTDown(torch.nn.Module):
             torch.nn.Flatten(),
             torch.nn.Linear(self.in_channel,self.in_channel//4),
             torch.nn.SiLU(inplace=True),
-            torch.nn.Linear(self.in_channel//4,4),
+            torch.nn.Linear(self.in_channel//4,4*self.in_channel),
             torch.nn.Sigmoid(),
         ])
         self.conv = torch.nn.Conv2d(self.in_channel,self.out_channel,3,1,1,bias=False)
@@ -776,17 +779,17 @@ class DWTDown(torch.nn.Module):
         soft_mask = self.soft_mask(x)
         # print(soft_mask.shape,LL.shape,x.shape) (64, 1024) torch.Size([64, 256, 16, 16]) torch.Size([64, 256, 32, 32])
         LL_mask,LH_mask,HL_mask,HH_mask = torch.chunk(soft_mask,4,1)
-        LL = LL * LL_mask.view(LL.shape[0],1,1,1)
-        LH = LH * LH_mask.view(LH.shape[0],1,1,1)
-        HL = HL * HL_mask.view(HL.shape[0],1,1,1)
-        HH = HH * HH_mask.view(HH.shape[0],1,1,1)
+        LL = LL * LL_mask.view(LL.shape[0],LL.shape[1],1,1)
+        LH = LH * LH_mask.view(LH.shape[0],LH.shape[1],1,1)
+        HL = HL * HL_mask.view(HL.shape[0],HL.shape[1],1,1)
+        HH = HH * HH_mask.view(HH.shape[0],HH.shape[1],1,1)
         output = LL+LH+HL+HH
         return self.conv(output)
 
 
 
 
-@persistence.persistent_class
+
 class DWTUNet(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution at input/output.
@@ -866,22 +869,22 @@ class DWTUNet(torch.nn.Module):
             if level == 0:
                 cin = cout
                 cout = model_channels
-                self.enc[f'{res}x{res}_conv'] = FuseConv(Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init),cout,emb_channels)
+                self.enc[f'{res}x{res}_conv'] = FuseConv(Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init),cout,cin,emb_channels)
             else:
-                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                self.enc[f'{res}x{res}_down'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
                 if encoder_type == 'skip':
-                    self.enc[f'{res}x{res}_aux_down'] = FuseConv(DWTDown(in_channel=caux,out_channel=caux),caux,emb_channels) \
-                        if self.use_dwt else FuseConv(Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter),caux,emb_channels)
+                    self.enc[f'{res}x{res}_aux_down'] = FuseConv(DWTDown(in_channel=caux,out_channel=caux),caux,caux,emb_channels) \
+                        if self.use_dwt else FuseConv(Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter),caux,caux,emb_channels)
                     self.enc[f'{res}x{res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
                 if encoder_type == 'residual':
-                    self.enc[f'{res}x{res}_aux_residual'] = FuseConv(DWTDown(in_channel=caux, out_channel=cout),cout,emb_channels) if self.use_dwt \
-                        else FuseConv(Conv2d(in_channels=caux, out_channels=cout, kernel=3, down=True, resample_filter=resample_filter, fused_resample=True, **init),cout,emb_channels)
+                    self.enc[f'{res}x{res}_aux_residual'] = FuseConv(DWTDown(in_channel=caux, out_channel=cout),cout,caux,emb_channels) if self.use_dwt \
+                        else FuseConv(Conv2d(in_channels=caux, out_channels=cout, kernel=3, down=True, resample_filter=resample_filter, fused_resample=True, **init),cout,caux,emb_channels)
                     caux = cout
             for idx in range(num_blocks):
                 cin = cout
                 cout = model_channels * mult
                 attn = (res in attn_resolutions)
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                self.enc[f'{res}x{res}_block{idx}'] = COMPILE_UNETBLOCK(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
         skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
 
         # Decoder.
@@ -889,21 +892,21 @@ class DWTUNet(torch.nn.Module):
         for level, mult in reversed(list(enumerate(channel_mult))):
             res = img_resolution >> level
             if level == len(channel_mult) - 1:
-                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                self.dec[f'{res}x{res}_in0'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
+                self.dec[f'{res}x{res}_in1'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
-                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                self.dec[f'{res}x{res}_up'] = COMPILE_UNETBLOCK(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
                 attn = (idx == num_blocks and res in attn_resolutions)
-                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                self.dec[f'{res}x{res}_block{idx}'] = COMPILE_UNETBLOCK(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
-                    self.dec[f'{res}x{res}_aux_up'] = FuseConv(DWTUp(in_channel=out_channels, out_channel=out_channels),out_channels,emb_channels) if self.use_dwt \
-                                                    else FuseConv(Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter),out_channels,emb_channels)
+                    self.dec[f'{res}x{res}_aux_up'] = FuseConv(DWTUp(in_channel=out_channels, out_channel=out_channels),out_channels,out_channels,emb_channels) if self.use_dwt \
+                                                    else FuseConv(Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter),out_channels,out_channels,emb_channels)
                 self.dec[f'{res}x{res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
-                self.dec[f'{res}x{res}_aux_conv'] = FuseConv(Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero),out_channels,emb_channels)
+                self.dec[f'{res}x{res}_aux_conv'] = FuseConv(Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero),out_channels,cout,emb_channels)
     def forward(self, x, noise_labels, class_labels = None, augment_labels=None):
         # Mapping.
         emb = self.map_noise(noise_labels)
@@ -931,16 +934,16 @@ class DWTUNet(torch.nn.Module):
             elif 'aux_residual' in name:
                 x = skips[-1] = aux = (x + block(aux,emb)) / np.sqrt(2)
             else:
-                x = block(x, emb) if isinstance(block, UNetBlock) else block(x,emb)
+                x = block(x, emb) if isinstance(block, torch._dynamo.eval_frame.OptimizedModule) and isinstance(block._orig_mod,UNetBlock) else block(x,emb)
                 skips.append(x)
 
         # Decoder.
         aux = None
         tmp = None
 
-        phi = noise_labels * (0.9 - self.phi) + self.phi
-        neg_phi = 2 * (1 - phi) # noise_label is 0, neg_phi is 1; noise_label is 1, neg_phi is 0.2
-        pos_phi = 2 * phi       # noise_label is 0, pos_phi is 1; noise_label is 1, pos_phi is 1.8
+        # phi = 0 * noise_labels * (0.9 - self.phi) + self.phi
+        # neg_phi = 2 * (1 - phi) # noise_label is 0, neg_phi is 1; noise_label is 1, neg_phi is 0.2
+        # pos_phi = 2 * phi       # noise_label is 0, pos_phi is 1; noise_label is 1, pos_phi is 1.8
         # 1 -> dwt 2 -> skip
 
         for name, block in self.dec.items():
@@ -953,7 +956,7 @@ class DWTUNet(torch.nn.Module):
                 aux = tmp if aux is None else tmp + aux
             else:
                 if x.shape[1] != block.in_channels:
-                    x = torch.cat([x*pos_phi.view(-1,1,1,1), skips.pop()*neg_phi.view(-1,1,1,1)], dim=1)
+                    x = torch.cat([x, skips.pop()], dim=1)
                 x = block(x, emb)
         return aux
 

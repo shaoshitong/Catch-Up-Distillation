@@ -7,8 +7,9 @@ from utils import RK
 import functools
 
 class BaseFlow():
-  def __init__(self, device, model=None, num_steps=1000):
+  def __init__(self, device, model=None, ema_model=None, num_steps=1000):
     self.model = model
+    self.ema_model = ema_model
     self.N = num_steps
     self.device = device
   
@@ -106,6 +107,7 @@ class RectifiedFlow(BaseFlow):
     elif len(z1.shape) == 4:
       t = t.view(-1, 1, 1, 1)
       z_t =  t * z1 + (1.-t) * z0
+      t = t.view(-1)
     else:
       raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
     target = z1 - z0 
@@ -366,7 +368,7 @@ class ConsistencyFlow(RectifiedFlow):
   
 
 class OnlineSlimFlow(RectifiedFlow):
-  def __init__(self, device, ema_model,model, num_steps=1000,TN=16):
+  def __init__(self, device, model, ema_model, num_steps=1000,TN=16):
     self.ema_model = ema_model
     self.model = model
     self.N = num_steps
@@ -393,7 +395,6 @@ class OnlineSlimFlow(RectifiedFlow):
     pred_z_t = self.model(pre_z_t,t)
     with torch.no_grad():
       ema_z_t = self.ema_model(now_z_t,now_t)
-
     gt_z_t = z1 - z0 
     return pred_z_t, ema_z_t, gt_z_t
   
