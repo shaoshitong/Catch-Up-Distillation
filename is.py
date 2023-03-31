@@ -67,7 +67,7 @@ def calculate_inception_stats(
         features = detector_net(images.to(device), **detector_kwargs).to(torch.float64)
         gen_probs.append(features)
 
-    gen_probs = torch.cat(gen_probs, dim=0).cpu.numpy()
+    gen_probs = torch.cat(gen_probs, dim=0).cpu().numpy()
     return gen_probs
 #----------------------------------------------------------------------------
 
