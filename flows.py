@@ -375,10 +375,10 @@ class OnlineSlimFlow(RectifiedFlow):
     self.TN = TN
     self.device = device
 
-  def get_train_tuple_one_step(self, z0=None, z1=None, t = None,eps=1e-2):
+  def get_train_tuple_one_step(self, z0=None, z1=None, t = None,eps=1e-5):
     if t is None:
       t = torch.rand((z0.shape[0],)).to(z1.device).float()
-      t[t<=(1/self.TN)]=1/self.TN
+      t = t*(1-eps)+eps
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -386,11 +386,12 @@ class OnlineSlimFlow(RectifiedFlow):
       pre_z_t =  t * z1 + (1.-t) * z0
       t = t.view(-1)
     else:
-      raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
+      raise NotImplementedError(f"z1.shape should be 2 or 4.")
     
     with torch.no_grad():
       now_z_t = pre_z_t - (1/self.TN)*self.ema_model(pre_z_t,t)
       now_t = t - (1/self.TN)
+      now_t = now_t.clamp(0,1)
     
     pred_z_t = self.model(pre_z_t,t)
     with torch.no_grad():

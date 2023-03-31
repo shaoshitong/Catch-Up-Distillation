@@ -1,15 +1,16 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
-"""                                                                                                              │·······························································
-python train_consistency_reverse_img_ddp.py --N 16 --gpu 4,5,6,7 --dir ./runs/cifar10-consistency2-beta20/ \
---weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 64 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json \
- --pretrain ./runs/cifar10-beta20/flow_model_500000_ema.pth --preforward ./runs/cifar10-beta20/forward_model_500000_ema.pth --loss_type lpips
-
-python train_online_slim_reverse_img_ddp.py  --N 16 --gpu 2,3 --dir ./runs/cifar10-onlineslim-3-beta20/ --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 128 --iterations 500000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type lpips
+"""
+python train_online_slim_reverse_img_ddp_2.py  --N 16 --gpu 0,1 \
+      --dir ./runs/cifar10-onlineslim-3-beta20/ --weight_prior 20 \
+      --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 \
+      --optimizer adam --batchsize 128 --iterations 500000 \
+      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type lpips \
+      --adaptive_weight True
 """
 import torch
 import numpy as np
-from flows import ConsistencyFlow,OnlineSlimFlow
+from flows import ConsistencyFlow,OnlineSlimFlow,RectifiedFlow
 import torch.nn as nn
 import tensorboardX
 import os,copy
@@ -33,14 +34,15 @@ from torch.distributed import init_process_group, destroy_process_group
 
 torch.manual_seed(0)
 
-def ddp_setup(rank, world_size):
+def ddp_setup(rank, world_size,arg):
     """
     Args:
         rank: Unique identifier of each process
         world_size: Total number of processes
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12348"
+    os.environ["MASTER_PORT"] = f"{12356+int(arg.gpu[0])}"
+    # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
     # Windows
     # init_process_group(backend="gloo", rank=rank, world_size=world_size)
     # Linux
@@ -56,7 +58,6 @@ def get_args():
     parser.add_argument('--batchsize', type=int, default = 256, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default = 8e-4, help='Learning rate')
     parser.add_argument('--independent', action = 'store_true',  help='Independent assumption, q(x,z) = p(x)p(z)')
-    parser.add_argument('--T-N',type=int,default=2, help='sampling steps in training')
     parser.add_argument('--resume', type=str, default = None, help='Training state path')
     parser.add_argument('--pretrain', type=str, default = None, help='Pretrain model state path')
     parser.add_argument('--preforward', type=str, default = None, help='Pretrain forward state path')
@@ -64,12 +65,13 @@ def get_args():
     parser.add_argument('--N', type=int, default = 16, help='Number of sampling steps')
     parser.add_argument('--num_samples', type=int, default = 64, help='Number of samples to generate')
     parser.add_argument('--no_ema', action='store_true', help='use EMA or not')
-    parser.add_argument('--l_weight',type=list, default=[1.,1.],nargs='+', action='append', help='List of numbers')
+    parser.add_argument('--l_weight',type=list, default=[2.,2.],nargs='+', action='append', help='List of numbers')
     parser.add_argument('--ema_after_steps', type=int, default = 1, help='Apply EMA after steps')
+    parser.add_argument('--adaptive_weight',action='store_true', help='Apply Adaptive Weight')
     parser.add_argument('--optimizer', type=str, default = 'adamw', help='adam / adamw')
     parser.add_argument('--warmup_steps', type=int, default = 0, help='Learning rate warmup')
     parser.add_argument('--weight_prior', type=float, default = 10, help='Prior loss weight')
-    parser.add_argument('--loss_type', type=str, default = "mse", help='The loss type for the flow model')
+    parser.add_argument('--loss_type', type=str, default = "mse", help='The loss type for the flow model, [mse, lpips, mse_lpips]')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
 
@@ -81,13 +83,15 @@ def get_args():
 
 
 def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_loader, iterations, device, start_iter, warmup_steps, dir, learning_rate, independent,
-                         ema_after_steps, use_ema, samples_test, sampling_steps, world_size, weight_prior,T_N,arg):
+                         ema_after_steps, use_ema, samples_test, sampling_steps, world_size, weight_prior,arg):
     if rank == 0:
         writer = tensorboardX.SummaryWriter(log_dir=dir)
+    torch.manual_seed(34+rank)
     samples_test = samples_test.to(device)
     # use tqdm if rank == 0
     tqdm_ = tqdm if rank == 0 else lambda x: x
-    criticion = nn.MSELoss().cuda(rank) if arg.loss_type == "mse" else LPIPS().cuda(rank)
+    criticion = nn.MSELoss().cuda(rank) if arg.loss_type != "lpips" else LPIPS().cuda(rank)
+    criticion_2 = nn.MSELoss().cuda(rank) if arg.loss_type == "mse" else LPIPS().cuda(rank)
     for i in tqdm_(range(start_iter, iterations+1)):
         optimizer.zero_grad()
         # Learning rate warmup
@@ -107,10 +111,13 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
             loss_prior = get_kl(mu, logvar)
         pred_z_t,ema_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
+        # z_t,t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z)
+        # pred_z_t = rectified_flow.model(z_t,t)
         # Learn reverse model
-        loss_fm = arg.l_weight[1] * torch.nn.functional.mse_loss(pred_z_t , gt_z_t,reduction="mean")
-        #  (i/iterations) * arg.l_weight[0] * criticion(pred_z_t , ema_z_t) + 
-        # loss_fm = arg.l_weight[0] * criticion(pred_z_t , ema_z_t) + arg.l_weight[1] * torch.nn.functional.mse_loss(pred_z_t , gt_z_t,reduction="mean")
+        if arg.adaptive_weight:
+            loss_fm = (i/iterations) * arg.l_weight[0] * criticion_2(pred_z_t , ema_z_t) + (1-i/iterations) * arg.l_weight[1] * criticion(pred_z_t , gt_z_t)
+        else:
+            loss_fm = 0.5 * arg.l_weight[0] * criticion_2(pred_z_t , ema_z_t) + 0.5 * arg.l_weight[1] * criticion(pred_z_t , gt_z_t)
         loss_fm = loss_fm.mean()
         loss = loss_fm + weight_prior * loss_prior
         loss.backward()
@@ -132,7 +139,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             with open(os.path.join(dir, 'log.txt'), 'a') as f:
                 f.write(f"Iteration {i}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
 
-        if i % 10000 == 1 and rank == 0:
+        if i % 5000 == 1 and rank == 0:
             rectified_flow.model.eval()
             if use_ema:
                 rectified_flow.ema_model.ema_swap(rectified_flow.model)
@@ -256,11 +263,13 @@ def get_loader(dataset, batchsize, world_size, rank):
                                             batch_size=batchsize,
                                             drop_last=True,
                                             num_workers=4,
-                                            sampler = DistributedSampler(dataset_train, num_replicas=world_size, rank=rank))
+                                            sampler = DistributedSampler(dataset_train, num_replicas=world_size, rank=rank),
+                                             pin_memory = True)
     data_loader_test = torch.utils.data.DataLoader(dataset=dataset_test,
                                                 batch_size=batchsize,
                                                 shuffle=False,
-                                                drop_last=True)
+                                                drop_last=True,
+                                                pin_memory = True)
     samples_test = next(iter(data_loader_test))[0][:4]
     return data_loader, samples_test, res, input_nc
 
@@ -270,7 +279,7 @@ def parse_config(config_path):
     return config
 
 def main(rank: int, world_size: int, arg):
-    ddp_setup(rank, world_size)
+    ddp_setup(rank, world_size,arg)
     device = torch.device(f"cuda:{rank}")
     assert arg.config_de is not None
     if not arg.independent:
@@ -291,7 +300,7 @@ def main(rank: int, world_size: int, arg):
         forward_model = UNetEncoder(encoder = encoder, input_nc = input_nc)
     else:
         forward_model = None
-    forward_model = torch.compile(forward_model,backend="inductor")
+    # forward_model = torch.compile(forward_model,backend="inductor")
 
     if arg.pretrain is not None:
         pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
@@ -308,7 +317,7 @@ def main(rank: int, world_size: int, arg):
         start_iter = training_state['iter']
 
         flow_model = model_class(**config_de)
-        flow_model = torch.compile(flow_model,backend="inductor")
+        # flow_model = torch.compile(flow_model,backend="inductor")
         flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][1]))
         if forward_model is not None:
             forward_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['forward_model_state_dict']))
@@ -316,7 +325,7 @@ def main(rank: int, world_size: int, arg):
     else:
         start_iter = 0
         flow_model = model_class(**config_de)
-        flow_model = torch.compile(flow_model,backend="inductor")
+        # flow_model = torch.compile(flow_model,backend="inductor")
         if arg.pretrain is not None:
             flow_model.load_state_dict(convert_ddp_state_dict_to_single(pretrain_state))
             print("Successfully Load Pretrained Flow Model!")
@@ -356,9 +365,8 @@ def main(rank: int, world_size: int, arg):
         forward_model = forward_model.to(device)
         forward_model = DDP(forward_model, device_ids=[rank])
     flow_model = flow_model.to(device)
+    flow_model = torch.compile(flow_model,backend="inductor")
     flow_model = DDP(flow_model, device_ids=[rank])
-    torch._dynamo.config.suppress_errors = True
-    # learnable parameters: forward model and flow model if flow model is not none
     learnable_params = []
     if forward_model is not None:
         learnable_params += list(forward_model.parameters())
@@ -373,13 +381,14 @@ def main(rank: int, world_size: int, arg):
         ema_model = EMAMODEL(model=flow_model)
         if arg.resume is not None:
             ema_model.ema_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][0]))
-    rectified_flow = OnlineSlimFlow(device, ema_model, flow_model, num_steps = arg.N)
-
+    # torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.verbose=True
+    rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, num_steps = arg.N)
     train_rectified_flow(rank = rank, rectified_flow = rectified_flow, forward_model = forward_model, optimizer = optimizer,
                         data_loader = data_loader, iterations = now_iteration, device = device, start_iter = start_iter,
                         warmup_steps = arg.warmup_steps, dir = arg.dir, learning_rate = arg.learning_rate, independent = arg.independent,
                         samples_test = samples_test, use_ema = arg.use_ema, ema_after_steps = arg.ema_after_steps, sampling_steps = arg.N, world_size=world_size,
-                        weight_prior=arg.weight_prior,T_N=arg.T_N,arg = arg)
+                        weight_prior=arg.weight_prior,arg = arg)
     destroy_process_group()
 
 if __name__ == "__main__":

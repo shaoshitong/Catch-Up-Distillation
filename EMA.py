@@ -104,7 +104,7 @@ class EMAMODEL(object):
 
     @torch.no_grad()
     def ema_step(self,decay_rate=0.9999,model=None):
-        for param,ema_param in zip(self.ema_model.parameters(),model.parameters()):
+        for param,ema_param in zip(model.parameters(),self.ema_model.parameters()):
             ema_param.data.mul_(decay_rate).add_(param.data, alpha=1. - decay_rate)
     
     @torch.no_grad()

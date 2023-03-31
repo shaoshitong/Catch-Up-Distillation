@@ -198,7 +198,7 @@ class UNetBlock(torch.nn.Module):
         return x
 
 
-COMPILE_UNETBLOCK = lambda *args, **kwargs: torch.compile(UNetBlock(*args, **kwargs),fullgraph=True,mode="max-autotune")
+COMPILE_UNETBLOCK = lambda *args, **kwargs: UNetBlock(*args, **kwargs)
 #----------------------------------------------------------------------------
 # Timestep embedding used in the DDPM++ and ADM architectures.
 
@@ -376,7 +376,7 @@ class SongUNet(torch.nn.Module):
             elif 'aux_residual' in name:
                 x = skips[-1] = aux = (x + block(aux)) / np.sqrt(2)
             else:
-                x = block(x, emb) if isinstance(block, torch._dynamo.eval_frame.OptimizedModule) and isinstance(block._orig_mod,UNetBlock) else block(x)
+                x = block(x, emb) if isinstance(block,UNetBlock) else block(x)
                 skips.append(x)
 
         # # Decoder.
@@ -934,7 +934,7 @@ class DWTUNet(torch.nn.Module):
             elif 'aux_residual' in name:
                 x = skips[-1] = aux = (x + block(aux,emb)) / np.sqrt(2)
             else:
-                x = block(x, emb) if isinstance(block, torch._dynamo.eval_frame.OptimizedModule) and isinstance(block._orig_mod,UNetBlock) else block(x,emb)
+                x = block(x, emb) if isinstance(block,UNetBlock) else block(x)
                 skips.append(x)
 
         # Decoder.

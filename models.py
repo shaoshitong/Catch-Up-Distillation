@@ -182,6 +182,7 @@ class FourierMLP(nn.Module):
             nn.Linear(channels, int(np.prod(output_dim))),
         )
 
+
     def forward(self, inputs, cond):
         sin_embed_cond = torch.sin(
             (self.timestep_coeff * cond.float()) + self.timestep_phase
