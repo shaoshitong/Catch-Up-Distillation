@@ -222,7 +222,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             # Save training state
             d = {}
             d['optimizer_state_dict'] = optimizer.state_dict()
-            d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.model.state_dict()]
+            d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
             d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
             if forward_model is not None:
                 d['forward_model_state_dict'] = forward_model.module.state_dict()
@@ -233,7 +233,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             # Save the latest training state
             d = {}
             d['optimizer_state_dict'] = optimizer.state_dict()
-            d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.model.state_dict()]
+            d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
             d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
             if forward_model is not None:
                 d['forward_model_state_dict'] = forward_model.module.state_dict()

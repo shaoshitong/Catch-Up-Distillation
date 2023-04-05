@@ -26,6 +26,7 @@ def get_args():
     parser.add_argument('--gpu', type=str, help='gpu index')
     parser.add_argument('--dir', type=str, help='Saving directory name')
     parser.add_argument('--ckpt', type=str, default = None, help='Flow network checkpoint')
+    parser.add_argument('--not_ema',action='store_true', help='If use ema_model')
     parser.add_argument('--batchsize', type=int, default = 4, help='Batch size')
     parser.add_argument('--res', type=int, default = 64, help='Image resolution')
     parser.add_argument('--input_nc', type=int, default = 3, help='Unet num_channels')
@@ -35,6 +36,7 @@ def get_args():
     parser.add_argument('--dataset', type=str, help='cifar10 / mnist / celebahq')
     parser.add_argument('--no_scale', action='store_true', help='Store true if the model is trained on [0,1] scale')    
     parser.add_argument('--save_traj', action='store_true', help='Save the trajectories')    
+    parser.add_argument('--save_sub_traj', action='store_true', help='Save the sub trajectories')   
     parser.add_argument('--save_z', action='store_true', help='Save zs for distillation')    
     parser.add_argument('--save_data', action='store_true', help='Save data')    
     parser.add_argument('--solver', type=str, default = 'euler', help='ODE solvers')
@@ -65,6 +67,10 @@ def main(arg):
         os.makedirs(os.path.join(arg.dir, "trajs"))
     if not os.path.exists(os.path.join(arg.dir, "data")):
         os.makedirs(os.path.join(arg.dir, "data"))
+    a_N = arg.N if arg.solver == "euler" else (arg.N + 1)//2
+    for i in range(a_N):
+        if not os.path.exists(os.path.join(arg.dir, f"trajs_{i}")):
+            os.makedirs(os.path.join(arg.dir, f"trajs_{i}"))
     
 
 
@@ -76,7 +82,10 @@ def main(arg):
     flow_model = model_class(**config)
     device_ids = arg.gpu.split(',')
     if arg.ckpt is not None:
-        flow_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.ckpt, map_location = "cpu")))
+        if not arg.not_ema:
+            flow_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.ckpt, map_location = "cpu")))
+        else:
+            flow_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.ckpt, map_location = "cpu")["model_state_dict"][0]))
     else:
         raise NotImplementedError("Model ckpt should be provided.")
     if len(device_ids) > 1:
@@ -176,6 +185,9 @@ def main(arg):
                     np.save(os.path.join(arg.dir, "zs", f"{i:05d}.npy"), z[idx].cpu().numpy())
                 if arg.save_data:
                     save_image(x[idx] * 0.5 + 0.5 if not arg.no_scale else x[idx], os.path.join(arg.dir, "data", f"{i:05d}.png"))
+                if arg.save_sub_traj:
+                    for mm,trag_sub_x0 in enumerate(traj_uncond_x0):
+                        save_image(trag_sub_x0[idx], os.path.join(arg.dir, f"trajs_{mm}", f"{i:05d}.jpg"))
                 i+=1
                 if i >= arg.num_samples:
                     break

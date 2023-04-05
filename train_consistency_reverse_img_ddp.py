@@ -358,7 +358,6 @@ def main(rank: int, world_size: int, arg):
         if arg.resume is not None:
             ema_model.ema_model.module.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][0]))
     rectified_flow = ConsistencyFlow(device, flow_model, ema_model, num_steps = arg.N)
-
     train_rectified_flow(rank = rank, rectified_flow = rectified_flow, forward_model = forward_model, optimizer = optimizer,
                         data_loader = data_loader, iterations = now_iteration, device = device, start_iter = start_iter,
                         warmup_steps = arg.warmup_steps, dir = arg.dir, learning_rate = arg.learning_rate, independent = arg.independent,

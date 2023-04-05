@@ -95,6 +95,7 @@ class Dataset(torch.utils.data.Dataset):
             if self._cache:
                 self._cached_images[raw_idx] = image
         assert isinstance(image, np.ndarray)
+
         assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
         if self._xflip[idx]:
