@@ -118,5 +118,5 @@ class EMAMODEL(object):
     
     @torch.no_grad()
     def __call__(self, pre_z_t,t):
-        return self.ema_model(pre_z_t,t)
+        return self.ema_model.module(pre_z_t,t)
 

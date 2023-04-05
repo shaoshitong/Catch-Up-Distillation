@@ -133,6 +133,7 @@ def convert_ddp_state_dict_to_single(ddp_state_dict):
     for key, value in ddp_state_dict.items():
         # 去掉 "module." 前缀
         new_key = key.replace('module.', '') if key.startswith('module.') else key
+        # new_key = new_key.replace('_orig_mod.', '') if new_key.startswith('_orig_mod.') else new_key
         single_state_dict[new_key] = value
     return single_state_dict
 def RK(function,value,start,step,step_nums,method="RK45"):

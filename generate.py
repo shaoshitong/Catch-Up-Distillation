@@ -74,7 +74,6 @@ def main(arg):
         model_class = SongUNet
     # Pass the arguments in the config file to the model
     flow_model = model_class(**config)
-    flow_model = torch.compile(flow_model,backend="inductor")
     device_ids = arg.gpu.split(',')
     if arg.ckpt is not None:
         flow_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.ckpt, map_location = "cpu")))

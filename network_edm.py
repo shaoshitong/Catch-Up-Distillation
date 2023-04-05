@@ -261,6 +261,8 @@ class SongUNet(torch.nn.Module):
         encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+        prior_shakedrop     = False,        # If applying Prior ShakeDrop to the network.
+        phi                 = 0.3,           # Prior ShakeDrop probability.
         **kwargs
     ):
         assert embedding_type in ['fourier', 'positional']
@@ -287,6 +289,9 @@ class SongUNet(torch.nn.Module):
             'decoder_type'      : decoder_type,
             'resample_filter'   : resample_filter,
         }
+        self.prior_shakedrop = prior_shakedrop
+        if self.prior_shakedrop:
+            self.phi = phi
         self.label_dropout = label_dropout
         emb_channels = model_channels * channel_mult_emb
         noise_channels = model_channels * channel_mult_noise
@@ -349,9 +354,11 @@ class SongUNet(torch.nn.Module):
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
                     self.dec[f'{res}x{res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter)
                 self.dec[f'{res}x{res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
+                self.meta_in_channel = cout
+                self.meta_out_channel = out_channels
                 self.dec[f'{res}x{res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, noise_labels, class_labels = None, augment_labels=None):
+    def forward(self, x, noise_labels, class_labels = None, augment_labels=None,return_features=False):
         # Mapping.
         emb = self.map_noise(noise_labels)
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
@@ -379,6 +386,16 @@ class SongUNet(torch.nn.Module):
                 x = block(x, emb) if isinstance(block,UNetBlock) else block(x)
                 skips.append(x)
 
+        if self.prior_shakedrop:
+            phi = noise_labels * (1- 2*self.phi) + self.phi
+            neg_phi = 2 * (1 - phi) # noise_label is 0, neg_phi is 1.4; noise_label is 1, neg_phi is 0.6
+            pos_phi = 2 * phi       # noise_label is 0, pos_phi is 0.6; noise_label is 1, pos_phi is 1.4
+            neg_phi = neg_phi.view(noise_labels.shape[0],1,1,1)
+            pos_phi = pos_phi.view(noise_labels.shape[0],1,1,1)
+        else:
+            neg_phi = torch.ones_like(noise_labels,device=noise_labels.device).view(noise_labels.shape[0],1,1,1)
+            pos_phi = torch.ones_like(noise_labels,device=noise_labels.device).view(noise_labels.shape[0],1,1,1)
+
         # # Decoder.
         aux = None
         tmp = None
@@ -392,9 +409,12 @@ class SongUNet(torch.nn.Module):
                 aux = tmp if aux is None else tmp + aux
             else:
                 if 'block' in name:
-                    x = torch.cat([x, skips.pop()], dim=1)
+                    x = torch.cat([x*pos_phi, skips.pop()*neg_phi], dim=1)
                 x = block(x, emb)
-        return aux
+        if return_features:
+            return aux,x
+        else:
+            return aux
 
 #----------------------------------------------------------------------------
 # Reimplementation of the ADM architecture from the paper
@@ -403,6 +423,18 @@ class SongUNet(torch.nn.Module):
 # https://github.com/openai/guided-diffusion
 
 
+class MetaGenerator(torch.nn.Module):
+    def __init__(self,in_channel,out_channel):
+        super().__init__()
+        init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.block = torch.nn.Sequential(GroupNorm(num_channels=in_channel, eps=1e-6),
+                                         torch.nn.SiLU(inplace=True),
+                                         Conv2d(in_channels=in_channel, out_channels=out_channel, kernel=3, **init_zero))
+    def forward(self,x):
+        return self.block(x)
+    
 class DhariwalUNet(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution at input/output.
@@ -466,7 +498,7 @@ class DhariwalUNet(torch.nn.Module):
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, noise_labels, class_labels, augment_labels=None):
+    def forward(self, x, noise_labels, class_labels, augment_labels=None,return_features=False):
         # Mapping.
         emb = self.map_noise(noise_labels)
         if self.map_augment is not None and augment_labels is not None:

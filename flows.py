@@ -65,9 +65,13 @@ class BaseFlow():
         vt = self.model(z, t)
       elif len(z1.shape) == 4:
         vt = self.model(z, t.squeeze())
-        if solver == 'heun' and i > 1:
-          z_next = z.detach().clone() + vt * dt
-          vt_next = self.model(z_next, t_next.squeeze())
+        if solver == 'heun':
+          if i==1:
+            z_next = z.detach().clone() + vt * (dt+1e-1)
+            vt_next = self.model(z_next, (t_next+1e-1).squeeze())
+          else:
+            z_next = z.detach().clone() + vt * dt
+            vt_next = self.model(z_next, t_next.squeeze())
           vt = (vt + vt_next) / 2
         x0hat = z - vt * t.view(-1,1,1,1)
         x0hat_list.append(x0hat)
@@ -337,8 +341,10 @@ class ResidualFlow(RectifiedFlow):
     return z1
 
 class ConsistencyFlow(RectifiedFlow):
-  def __init__(self, device, ema_model,model, num_steps=1000,TN=16):
+  def __init__(self, device,model, ema_model,num_steps=1000,TN=16):
     self.ema_model = ema_model
+    import copy
+    self.pre_train_model = copy.deepcopy(model)
     self.model = model
     self.N = num_steps
     self.TN = TN
@@ -347,7 +353,6 @@ class ConsistencyFlow(RectifiedFlow):
   def get_train_tuple(self, z0=None, z1=None, t = None,eps=1e-2):
     if t is None:
       t = torch.rand((z0.shape[0],)).to(z1.device).float()
-      t[t<=(1/self.TN)]=1/self.TN
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -358,8 +363,8 @@ class ConsistencyFlow(RectifiedFlow):
       raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
     
     with torch.no_grad():
-      now_z_t = pre_z_t - (1/self.TN)*self.ema_model(pre_z_t,t)
-      now_t = t - (1/self.TN)
+      now_z_t = pre_z_t - (1/self.TN)*self.pre_train_model(pre_z_t,t)
+      now_t = torch.clamp(t - (1/self.TN),0,1)
     
     pred_z_t = self.model(pre_z_t,t)
     with torch.no_grad():
@@ -368,12 +373,19 @@ class ConsistencyFlow(RectifiedFlow):
   
 
 class OnlineSlimFlow(RectifiedFlow):
-  def __init__(self, device, model, ema_model, num_steps=1000,TN=16):
+  def __init__(self, device, model, ema_model, generator_list=None, num_steps=1000,TN=16):
     self.ema_model = ema_model
     self.model = model
     self.N = num_steps
     self.TN = TN
     self.device = device
+    if generator_list == None:
+      self.cu_number = 1
+    else:
+      assert isinstance(generator_list,list)
+      self.cu_number = len(generator_list) + 1
+    self.generator_list = generator_list # include [g2,g3]
+
 
   def get_train_tuple_one_step(self, z0=None, z1=None, t = None,eps=1e-5):
     if t is None:
@@ -388,19 +400,100 @@ class OnlineSlimFlow(RectifiedFlow):
     else:
       raise NotImplementedError(f"z1.shape should be 2 or 4.")
     
+    ############################################## Train Model Prediction ###############################################
+    pred_z_t = self.model(pre_z_t,t)
+
+    ############################################## EMA Model Prediction #################################################
     with torch.no_grad():
       now_z_t = pre_z_t - (1/self.TN)*self.ema_model(pre_z_t,t)
       now_t = t - (1/self.TN)
-      now_t = now_t.clamp(0,1)
-    
-    pred_z_t = self.model(pre_z_t,t)
-    with torch.no_grad():
+      now_t = now_t.clamp(eps,1)
       ema_z_t = self.ema_model(now_z_t,now_t)
+
+    ############################################## Ground Truth #########################################################
     gt_z_t = z1 - z0 
+
     return pred_z_t, ema_z_t, gt_z_t
   
+  def get_train_tuple_two_step(self, z0 = None, z1 = None, t = None,eps = 1e-5):
+    if t is None:
+      t = torch.rand((z0.shape[0],)).to(z1.device).float()
+      t = t*(1-eps)+eps
+    if len(z1.shape) == 2:
+      pre_z_t =  t * z1 + (1.-t) * z0
+    elif len(z1.shape) == 4:
+      t = t.view(-1, 1, 1, 1)
+      pre_z_t =  t * z1 + (1.-t) * z0
+      t = t.view(-1)
+    else:
+      raise NotImplementedError(f"z1.shape should be 2 or 4.")
+    
+    ############################################## Train Model Prediction ###############################################
+    pred_1_z_t,features = self.model(pre_z_t,t,return_features=True)
+    pred_2_z_t = self.generator_list[0](features)
+    pred_list = [pred_1_z_t,pred_2_z_t]
+
+    ############################################## EMA Model Prediction #################################################
+    with torch.no_grad():
+      h = 1/self.TN
+      k1 = self.ema_model(pre_z_t,t)
+      k2 = self.ema_model(pre_z_t-h*k1,torch.clamp(t-1/self.TN,eps,1))
+      ema_1_z_t = pre_z_t - h*((1/2)*k1+(1/2)*k2)
+      ema_2_z_t = pre_z_t - h*(k1+k2)
+      ema_1_z_t = self.ema_model(ema_1_z_t,torch.clamp(t-1/self.TN,eps,1))
+      ema_2_z_t = self.ema_model(ema_2_z_t,torch.clamp(t-2/self.TN,eps,1))
+      ema_list = [ema_1_z_t,ema_2_z_t]
+    ############################################## GT ##################################################################
+    gt_z_t = z1 - z0 
+
+    return pred_list, ema_list, gt_z_t
+  
+  def get_train_tuple_three_step(self, z0=None, z1=None, t = None,eps=1e-5):
+      if t is None:
+        t = torch.rand((z0.shape[0],)).to(z1.device).float()
+        t = t*(1-eps)+eps
+      if len(z1.shape) == 2:
+        pre_z_t =  t * z1 + (1.-t) * z0
+      elif len(z1.shape) == 4:
+        t = t.view(-1, 1, 1, 1)
+        pre_z_t =  t * z1 + (1.-t) * z0
+        t = t.view(-1)
+      else:
+        raise NotImplementedError(f"z1.shape should be 2 or 4.")
+      ############################################## Train Model Prediction ###############################################
+      pred_1_z_t,features = self.model(pre_z_t,t,return_features=True)
+      pred_2_z_t = self.generator_list[0](features)
+      pred_3_z_t = self.generator_list[0](features)
+      pred_list = [pred_1_z_t,pred_2_z_t,pred_3_z_t]
+
+      ############################################## EMA Model Prediction #################################################
+      with torch.no_grad():
+        h = 1/self.TN
+        k1 = self.ema_model(pre_z_t,t)
+        k2 = self.ema_model(pre_z_t-h*k1,torch.clamp(t-1/self.TN,eps,1))
+        k3 = self.ema_model(pre_z_t-(7*h*k1/4+1*h*k2/4),torch.clamp(t-2/self.TN,eps,1))
+        ema_1_z_t = pre_z_t - h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
+        ema_2_z_t = pre_z_t - 2*h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
+        ema_3_z_t = pre_z_t - 3*h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
+        ema_1_z_t = self.ema_model(ema_1_z_t,torch.clamp(t-1/self.TN,eps,1))
+        ema_2_z_t = self.ema_model(ema_2_z_t,torch.clamp(t-2/self.TN,eps,1))
+        ema_3_z_t = self.ema_model(ema_3_z_t,torch.clamp(t-2/self.TN,eps,1))
+        ema_list = [ema_1_z_t,ema_2_z_t,ema_3_z_t]
+
+      ############################################## GT ##################################################################
+      gt_z_t = z1 - z0 
+
+      return pred_list, ema_list, gt_z_t
+        
+
+
   def get_train_tuple(self, z0=None, z1=None, t=None, eps=0.00001,pred_step=1):
     if pred_step==1:
       return self.get_train_tuple_one_step(z0,z1,t,eps)
+    elif pred_step==2:
+      return self.get_train_tuple_two_step(z0,z1,t,eps)
+    elif pred_step==3:
+      return self.get_train_tuple_three_step(z0,z1,t,eps)
     else:
       raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
+  
