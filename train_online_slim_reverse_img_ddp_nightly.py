@@ -346,7 +346,7 @@ def main(rank: int, world_size: int, arg):
 
         flow_model = model_class(**config_de)
         now_iteration = arg.iterations
-        flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][1]))
+        flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][0]))
         if forward_model is not None:
             forward_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['forward_model_state_dict']))
         print("Successfully Load Checkpoint!")
@@ -407,7 +407,7 @@ def main(rank: int, world_size: int, arg):
 
     if arg.resume is not None:
         for i,generator in enumerate(generator_list):
-            generator.load_state_dict(convert_ddp_state_dict_to_single(training_state['generator_state_dict'][i]))
+            generator.load_state_dict(training_state['generator_list'][i])
 
     ################################### Learning Optimizer ###################################################
     learnable_params = []
@@ -429,7 +429,7 @@ def main(rank: int, world_size: int, arg):
         if generator_list is not None:
             ema_generator_list = [EMAMODEL(model=generator) for generator in generator_list]
         if arg.resume is not None:
-            ema_model.ema_model.load_state_dict(training_state['model_state_dict'][0])
+            ema_model.ema_model.load_state_dict(training_state['model_state_dict'][1])
 
     rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,)
     if rank==0:

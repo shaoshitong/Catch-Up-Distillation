@@ -66,10 +66,7 @@ class BaseFlow():
       elif len(z1.shape) == 4:
         vt = self.model(z, t.squeeze())
         if solver == 'heun':
-          if i==1:
-            z_next = z.detach().clone() + vt * (dt+1e-1)
-            vt_next = self.model(z_next, (t_next+1e-1).squeeze())
-          else:
+          if i!=1:
             z_next = z.detach().clone() + vt * dt
             vt_next = self.model(z_next, t_next.squeeze())
           vt = (vt + vt_next) / 2
@@ -391,6 +388,7 @@ class OnlineSlimFlow(RectifiedFlow):
     if t is None:
       t = torch.rand((z0.shape[0],)).to(z1.device).float()
       t = t*(1-eps)+eps
+      mask = (t>=eps+1/self.TN)
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -409,7 +407,7 @@ class OnlineSlimFlow(RectifiedFlow):
       now_t = t - (1/self.TN)
       now_t = now_t.clamp(eps,1)
       ema_z_t = self.ema_model(now_z_t,now_t)
-
+      ema_z_t = torch.where(mask,ema_z_t,z1-z0)
     ############################################## Ground Truth #########################################################
     gt_z_t = z1 - z0 
 
@@ -419,6 +417,7 @@ class OnlineSlimFlow(RectifiedFlow):
     if t is None:
       t = torch.rand((z0.shape[0],)).to(z1.device).float()
       t = t*(1-eps)+eps
+      mask = (t>=eps+2/self.TN)
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -437,12 +436,12 @@ class OnlineSlimFlow(RectifiedFlow):
     with torch.no_grad():
       h = 1/self.TN
       k1 = self.ema_model(pre_z_t,t)
-      k2 = self.ema_model(pre_z_t-h*k1,torch.clamp(t-1/self.TN,eps,1))
+      k2 = self.ema_model(pre_z_t-h*k1,t-1/self.TN)
       ema_1_z_t = pre_z_t - h*((1/2)*k1+(1/2)*k2)
       ema_2_z_t = pre_z_t - h*(k1+k2)
       ema_1_z_t = self.ema_model(ema_1_z_t,torch.clamp(t-1/self.TN,eps,1))
       ema_2_z_t = self.ema_model(ema_2_z_t,torch.clamp(t-2/self.TN,eps,1))
-      ema_list = [ema_1_z_t,ema_2_z_t]
+      ema_list = [torch.where(mask,ema_1_z_t,z1 - z0),torch.where(mask,ema_2_z_t,z1-z0)]
     ############################################## GT ##################################################################
     gt_z_t = z1 - z0 
 
@@ -452,6 +451,7 @@ class OnlineSlimFlow(RectifiedFlow):
       if t is None:
         t = torch.rand((z0.shape[0],)).to(z1.device).float()
         t = t*(1-eps)+eps
+        mask = (t>=eps+3/self.TN)
       if len(z1.shape) == 2:
         pre_z_t =  t * z1 + (1.-t) * z0
       elif len(z1.shape) == 4:
@@ -477,8 +477,8 @@ class OnlineSlimFlow(RectifiedFlow):
         ema_3_z_t = pre_z_t - 3*h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
         ema_1_z_t = self.ema_model(ema_1_z_t,torch.clamp(t-1/self.TN,eps,1))
         ema_2_z_t = self.ema_model(ema_2_z_t,torch.clamp(t-2/self.TN,eps,1))
-        ema_3_z_t = self.ema_model(ema_3_z_t,torch.clamp(t-2/self.TN,eps,1))
-        ema_list = [ema_1_z_t,ema_2_z_t,ema_3_z_t]
+        ema_3_z_t = self.ema_model(ema_3_z_t,torch.clamp(t-3/self.TN,eps,1))
+        ema_list = [torch.where(mask,ema_1_z_t,z1-z0),torch.where(mask,ema_2_z_t,z1-z0),torch.where(mask,ema_3_z_t,z1-z0)]
 
       ############################################## GT ##################################################################
       gt_z_t = z1 - z0 
