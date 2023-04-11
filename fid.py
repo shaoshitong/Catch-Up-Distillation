@@ -22,7 +22,7 @@ from training import dataset
 
 def calculate_inception_stats(
     image_path, num_expected=None, seed=0, max_batch_size=64,
-    num_workers=3, prefetch_factor=2, device=torch.device('cuda'),
+    num_workers=2, prefetch_factor=2, device=torch.device('cuda'),
 ):
     # Rank 0 goes first.
     if dist.get_rank() != 0:
@@ -82,7 +82,9 @@ def calculate_inception_stats(
 def calculate_fid_from_inception_stats(mu, sigma, mu_ref, sigma_ref):
     m = np.square(mu - mu_ref).sum()
     s, _ = scipy.linalg.sqrtm(np.dot(sigma, sigma_ref), disp=False)
-    fid = m + np.trace(sigma + sigma_ref - s * 2)
+    c = np.trace(sigma + sigma_ref - s * 2)
+    print(m,c)
+    fid = m + c
     return float(np.real(fid))
 
 #----------------------------------------------------------------------------
@@ -120,8 +122,9 @@ def main():
 def calc(image_path, ref_path, num_expected, seed, batch):
     """Calculate FID for a given set of images."""
     torch.multiprocessing.set_start_method('spawn')
+    os.environ['MASTER_PORT'] = f"{29500+ int(os.environ['CUDA_VISIBLE_DEVICES'])+1}"
+    print(os.environ['MASTER_PORT'])
     dist.init()
-
     dist.print0(f'Loading dataset reference statistics from "{ref_path}"...')
     ref = None
     if dist.get_rank() == 0:
@@ -148,8 +151,9 @@ def calc(image_path, ref_path, num_expected, seed, batch):
 def ref(dataset_path, dest_path, batch):
     """Calculate dataset reference statistics needed by 'calc'."""
     torch.multiprocessing.set_start_method('spawn')
+    os.environ['MASTER_PORT'] = f"{29500+ os.environ['CUDA_VISIBLE_DEVICES']+1}"
+    print(os.environ['MASTER_PORT'])
     dist.init()
-
     mu, sigma = calculate_inception_stats(image_path=dataset_path, max_batch_size=batch)
     dist.print0(f'Saving dataset reference statistics to "{dest_path}"...')
     if dist.get_rank() == 0:

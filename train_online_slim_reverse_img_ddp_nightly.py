@@ -1,12 +1,11 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
-python train_online_slim_reverse_img_ddp_2.py  --N 16 --gpu 0,1 \
-      --dir ./runs/cifar10-onlineslim-3-beta20/ --weight_prior 20 \
+python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7 \
+      --dir ./runs/cifar10-onlineslim-predstep-1-3-beta20/ --weight_prior 20 \
       --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 \
       --optimizer adam --batchsize 128 --iterations 500000 \
-      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type lpips \
-      --adaptive_weight True
+      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --add_prior_z
 """
 import torch
 import numpy as np
@@ -71,6 +70,7 @@ def get_args():
     parser.add_argument('--optimizer', type=str, default = 'adamw', help='adam / adamw')
     parser.add_argument('--warmup_steps', type=int, default = 0, help='Learning rate warmup')
     parser.add_argument('--weight_prior', type=float, default = 10, help='Prior loss weight')
+    parser.add_argument('--add_prior_z', action='store_true', help='Add prior z to model')
     parser.add_argument('--shakedrop', action = 'store_true', help='Using shakedrop')
     parser.add_argument('--loss_type', type=str, default = "mse", help='The loss type for the flow model, [mse, lpips, mse_lpips]')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
@@ -332,7 +332,7 @@ def main(rank: int, world_size: int, arg):
     if arg.pretrain is not None:
         pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
     config_de['prior_shakedrop'] = arg.shakedrop
-
+    config_de['add_prior_z'] = arg.add_prior_z
     if config_de['unet_type'] == 'adm':
         model_class = UNetModel
     elif config_de['unet_type'] == 'songunet':
@@ -390,8 +390,10 @@ def main(rank: int, world_size: int, arg):
     ################################## FLOW MODEL AND FORWARD MODEL #########################################
     if forward_model is not None:
         forward_model = forward_model.to(device)
+        # forward_model = torch.compile(forward_model)
         forward_model = DDP(forward_model, device_ids=[rank])
     flow_model = flow_model.to(device)
+    # flow_model = torch.compile(flow_model)
     flow_model = DDP(flow_model, device_ids=[rank])
 
 
@@ -406,8 +408,10 @@ def main(rank: int, world_size: int, arg):
         generator_list = None
 
     if arg.resume is not None:
-        for i,generator in enumerate(generator_list):
-            generator.load_state_dict(training_state['generator_list'][i])
+        if generator_list is not None:
+            for i,generator in enumerate(generator_list):
+                generator.load_state_dict(training_state['generator_list'][i])
+
 
     ################################### Learning Optimizer ###################################################
     learnable_params = []
@@ -429,9 +433,9 @@ def main(rank: int, world_size: int, arg):
         if generator_list is not None:
             ema_generator_list = [EMAMODEL(model=generator) for generator in generator_list]
         if arg.resume is not None:
-            ema_model.ema_model.load_state_dict(training_state['model_state_dict'][1])
+            ema_model.ema_model.module.load_state_dict(training_state['model_state_dict'][1])
 
-    rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,)
+    rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,add_prior_z=arg.add_prior_z)
     if rank==0:
         print(f"Start training, with len(generator_list): {len(generator_list) if generator_list is not None else 0}, with adaptive_weight: {arg.adaptive_weight}")
         print(f"Iteration begin: {start_iter}, Iteration end: {now_iteration}, Iteration total: {now_iteration - start_iter}")

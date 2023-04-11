@@ -96,7 +96,7 @@ class Conv2d(torch.nn.Module):
 class GroupNorm(torch.nn.Module):
     def __init__(self, num_channels, num_groups=32, min_channels_per_group=4, eps=1e-5):
         super().__init__()
-        self.num_groups = min(num_groups, num_channels // min_channels_per_group)
+        self.num_groups = max(min(num_groups, num_channels // min_channels_per_group),1)
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(num_channels))
         self.bias = torch.nn.Parameter(torch.zeros(num_channels))
@@ -262,7 +262,8 @@ class SongUNet(torch.nn.Module):
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
         prior_shakedrop     = False,        # If applying Prior ShakeDrop to the network.
-        phi                 = 0.3,           # Prior ShakeDrop probability.
+        phi                 = 0.3,          # Prior ShakeDrop probability.
+        add_prior_z         = False,        # If adding the prior z to the output of the network. 
         **kwargs
     ):
         assert embedding_type in ['fourier', 'positional']
@@ -290,6 +291,7 @@ class SongUNet(torch.nn.Module):
             'resample_filter'   : resample_filter,
         }
         self.prior_shakedrop = prior_shakedrop
+        self.add_prior_z = add_prior_z
         if self.prior_shakedrop:
             self.phi = phi
         self.label_dropout = label_dropout
@@ -310,6 +312,7 @@ class SongUNet(torch.nn.Module):
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
         self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
         self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
+
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
@@ -357,8 +360,12 @@ class SongUNet(torch.nn.Module):
                 self.meta_in_channel = cout
                 self.meta_out_channel = out_channels
                 self.dec[f'{res}x{res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
+        if self.add_prior_z:
+            self.map_layer2 = Linear(in_features=emb_channels, out_features=1, **init)
+            self.prior_norm_map = GroupNorm(num_channels=in_channels, eps=1e-6)
+            self.prior_conv_map = Conv2d(in_channels=in_channels, out_channels=cout, kernel=3, **init)
 
-    def forward(self, x, noise_labels, class_labels = None, augment_labels=None,return_features=False):
+    def forward(self, x, noise_labels, class_labels = None, augment_labels=None,return_features=False,ori_z=None):
         # Mapping.
         emb = self.map_noise(noise_labels)
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
@@ -396,6 +403,10 @@ class SongUNet(torch.nn.Module):
             neg_phi = torch.ones_like(noise_labels,device=noise_labels.device).view(noise_labels.shape[0],1,1,1)
             pos_phi = torch.ones_like(noise_labels,device=noise_labels.device).view(noise_labels.shape[0],1,1,1)
 
+        if self.add_prior_z:
+            assert ori_z is not None
+            new_z = self.prior_conv_map(self.prior_norm_map(silu(self.map_layer2(emb)).view(emb.shape[0],1,1,1) * ori_z))
+
         # # Decoder.
         aux = None
         tmp = None
@@ -403,6 +414,7 @@ class SongUNet(torch.nn.Module):
             if 'aux_up' in name:
                 aux = block(aux)
             elif 'aux_norm' in name:
+                x = new_z+x if self.add_prior_z else x
                 tmp = block(x)
             elif 'aux_conv' in name:
                 tmp = block(silu(tmp))
@@ -411,6 +423,7 @@ class SongUNet(torch.nn.Module):
                 if 'block' in name:
                     x = torch.cat([x*pos_phi, skips.pop()*neg_phi], dim=1)
                 x = block(x, emb)
+    
         if return_features:
             return aux,x
         else:

@@ -2,7 +2,7 @@
 
 import torch
 import numpy as np
-from flows import RectifiedFlow,ResidualFlow
+from flows import RectifiedFlow,ResidualFlow,OnlineSlimFlow
 import torch.nn as nn
 import tensorboardX
 import os
@@ -11,7 +11,7 @@ from guided_diffusion.unet import UNetModel
 import torchvision.datasets as dsets
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
-from utils import straightness,convert_ddp_state_dict_to_single
+from utils import straightness,convert_ddp_state_dict_to_single,straightness_no_mean
 from dataset import CelebAHQImgDataset
 import argparse
 from tqdm import tqdm
@@ -27,7 +27,7 @@ def get_args():
     parser.add_argument('--dir', type=str, help='Saving directory name')
     parser.add_argument('--ckpt', type=str, default = None, help='Flow network checkpoint')
     parser.add_argument('--not_ema',action='store_true', help='If use ema_model')
-    parser.add_argument('--batchsize', type=int, default = 4, help='Batch size')
+    parser.add_argument('--batchsize', type=int, default = 256, help='Batch size')
     parser.add_argument('--res', type=int, default = 64, help='Image resolution')
     parser.add_argument('--input_nc', type=int, default = 3, help='Unet num_channels')
     parser.add_argument('--N', type=int, default = 20, help='Number of sampling steps')
@@ -40,6 +40,7 @@ def get_args():
     parser.add_argument('--save_z', action='store_true', help='Save zs for distillation')    
     parser.add_argument('--save_data', action='store_true', help='Save data')    
     parser.add_argument('--solver', type=str, default = 'euler', help='ODE solvers')
+    parser.add_argument('--if_pred_x0', action="store_true", help='If predict x0')
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
@@ -105,7 +106,7 @@ def main(arg):
     flow_model = flow_model.to(device)
 
 
-    rectified_flow = RectifiedFlow(device, flow_model, num_steps = arg.N)
+    rectified_flow = OnlineSlimFlow(device, flow_model, flow_model, None, num_steps = arg.N,add_prior_z=False,)
 
     rectified_flow.model.eval()
 
@@ -158,8 +159,8 @@ def main(arg):
             if arg.solver in ['euler', 'heun']:
                 traj_uncond, traj_uncond_x0 = rectified_flow.sample_ode_generative(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver)
                 x0 = traj_uncond[-1]
-                uncond_straightness = straightness(traj_uncond)
-                straightness_list.append(uncond_straightness.item())
+                uncond_straightness = straightness_no_mean(traj_uncond)
+                straightness_list.append(uncond_straightness)
             else:
                 x0, nfe = rectified_flow.sample_ode_generative_bbox(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver, atol = arg.atol, rtol = arg.rtol)
                 nfes.append(nfe)
@@ -177,7 +178,7 @@ def main(arg):
                 # (batch_size, channel, H, W * N) -> (channel, H * bsize, W * N)
                 grid = grid.permute(1, 0, 2, 3).contiguous().view(grid.shape[1], -1, grid.shape[3])
                 save_image(grid * 0.5 + 0.5 if not arg.no_scale else grid, os.path.join(arg.dir, "trajs", f"{ep:05d}_traj.png"))
-
+            
             for idx in range(len(x0)):
                 save_image(x0[idx] * 0.5 + 0.5 if not arg.no_scale else x0[idx], os.path.join(arg.dir, "samples", f"{i:05d}.png"))
                 # Save z as npy file
@@ -187,21 +188,15 @@ def main(arg):
                     save_image(x[idx] * 0.5 + 0.5 if not arg.no_scale else x[idx], os.path.join(arg.dir, "data", f"{i:05d}.png"))
                 if arg.save_sub_traj:
                     for mm,trag_sub_x0 in enumerate(traj_uncond_x0):
-                        save_image(trag_sub_x0[idx], os.path.join(arg.dir, f"trajs_{mm}", f"{i:05d}.jpg"))
+                        save_image(trag_sub_x0[idx]* 0.5 + 0.5 if not arg.no_scale else trag_sub_x0[idx], os.path.join(arg.dir, f"trajs_{mm}", f"{i:05d}.png"))
                 i+=1
                 if i >= arg.num_samples:
                     break
-
             x0_list.append(x0)
-        straightness_mean = np.mean(straightness_list)
-        print(f"straightness_mean: {straightness_mean}")
+        straightness_list = torch.stack(straightness_list).mean(dim=0).tolist()
+        print(f"cosine list: {straightness_list}")
         nfes_mean = np.mean(nfes) if len(nfes) > 0 else arg.N
         print(f"nfes_mean: {nfes_mean}")
-        z_norms = torch.stack(z_norm_list).view(-1)
-        result_dict = {"straightness_mean": straightness_mean, "z_norms": z_norms.tolist(), "nfes_mean": nfes_mean}
-        with open(os.path.join(arg.dir, 'result_sampling.json'), 'w') as f:
-            json.dump(result_dict, f, indent = 4)
-        
         
 
 if __name__ == "__main__":
