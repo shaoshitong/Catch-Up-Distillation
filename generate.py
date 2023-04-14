@@ -40,7 +40,6 @@ def get_args():
     parser.add_argument('--save_z', action='store_true', help='Save zs for distillation')    
     parser.add_argument('--save_data', action='store_true', help='Save data')    
     parser.add_argument('--solver', type=str, default = 'euler', help='ODE solvers')
-    parser.add_argument('--if_pred_x0', action="store_true", help='If predict x0')
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
     parser.add_argument('--seed', type=int, default=0, help='random seed')

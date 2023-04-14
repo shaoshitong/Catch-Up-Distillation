@@ -1,11 +1,11 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7 \
-      --dir ./runs/cifar10-onlineslim-predstep-1-3-beta20/ --weight_prior 20 \
+python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3 \
+      --dir ./runs/cifar10-onlineslim-predstep-2-rule-beta20/ --weight_prior 20 \
       --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 \
       --optimizer adam --batchsize 128 --iterations 500000 \
-      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --add_prior_z
+      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 2 --adapt_cu rule
 """
 import torch
 import numpy as np
@@ -67,11 +67,13 @@ def get_args():
     parser.add_argument('--l_weight',type=list, default=[2.,2.],nargs='+', action='append', help='List of numbers')
     parser.add_argument('--ema_after_steps', type=int, default = 1, help='Apply EMA after steps')
     parser.add_argument('--adaptive_weight',action='store_true', help='Apply Adaptive Weight')
+    parser.add_argument('--adapt_cu',type=str,default="origin", help='Apply Adaptive dt')
     parser.add_argument('--optimizer', type=str, default = 'adamw', help='adam / adamw')
     parser.add_argument('--warmup_steps', type=int, default = 0, help='Learning rate warmup')
     parser.add_argument('--weight_prior', type=float, default = 10, help='Prior loss weight')
     parser.add_argument('--add_prior_z', action='store_true', help='Add prior z to model')
     parser.add_argument('--shakedrop', action = 'store_true', help='Using shakedrop')
+    parser.add_argument('--sam', action = 'store_true', help='Using Sharpness Aware Minimization')
     parser.add_argument('--loss_type', type=str, default = "mse", help='The loss type for the flow model, [mse, lpips, mse_lpips]')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
@@ -112,7 +114,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
             loss_prior = get_kl(mu, logvar)
         
-        
+        #################################### Choose the loss function ####################################
         if arg.pred_step==1:
             pred_z_t,ema_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
                     # Learn reverse model
@@ -132,6 +134,16 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
                 loss_fm+= (1-i/iterations) * arg.l_weight[1] * criticion(pred_z_t_list[0] , gt_z_t)
             else:
                 loss_fm+= 0.5 * arg.l_weight[1] * criticion(pred_z_t_list[0] , gt_z_t)
+        else:
+            raise NotImplementedError
+        ################################### Sharpness Aware Minimization #################################
+        if arg.sam:
+            loss_sam = rectified_flow.L_sam
+        else:
+            loss_sam = torch.Tensor([0.]).to(device)
+        loss_fm+=loss_sam
+        #################################### Choose the loss function ####################################
+
         loss_fm = loss_fm.mean()
 
         loss = loss_fm + weight_prior * loss_prior
@@ -147,14 +159,15 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         if isinstance(loss_prior,torch.Tensor):
             loss_prior = loss_prior.item()
         if i % 100 == 0 and rank == 0:
-            print(f"Iteration {i}: loss {loss.item()}, loss_fm {loss_fm.item()}, loss_prior {loss_prior:.8f}")
+            print(f"Iteration {i}: loss {loss.item()}, loss_fm {loss_fm.item()}, loss_prior {loss_prior:.8f}, loss_sam {loss_sam.item():.8f}")
             writer.add_scalar("loss", loss.item(), i)
             writer.add_scalar("loss_fm", loss_fm.item(), i)
             writer.add_scalar("loss_prior", loss_prior, i)
+            writer.add_scalar("loss_sam", loss_sam.item(), i)
             writer.add_scalar("lr", optimizer.param_groups[0]['lr'], i)
             # Log to .txt file
             with open(os.path.join(dir, 'log.txt'), 'a') as f:
-                f.write(f"Iteration {i}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
+                f.write(f"Iteration {i}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, loss_sam {loss_sam.item():.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
 
         if i % 5000 == 1 and rank == 0:
             rectified_flow.model.eval()
@@ -435,7 +448,7 @@ def main(rank: int, world_size: int, arg):
         if arg.resume is not None:
             ema_model.ema_model.module.load_state_dict(training_state['model_state_dict'][1])
 
-    rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,add_prior_z=arg.add_prior_z)
+    rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,add_prior_z=arg.add_prior_z,adapt_cu=arg.adapt_cu,sam=arg.sam)
     if rank==0:
         print(f"Start training, with len(generator_list): {len(generator_list) if generator_list is not None else 0}, with adaptive_weight: {arg.adaptive_weight}")
         print(f"Iteration begin: {start_iter}, Iteration end: {now_iteration}, Iteration total: {now_iteration - start_iter}")

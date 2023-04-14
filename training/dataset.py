@@ -85,7 +85,7 @@ class Dataset(torch.utils.data.Dataset):
             pass
 
     def __len__(self):
-        return self._raw_idx.size
+        return len(self._raw_idx)
 
     def __getitem__(self, idx):
         raw_idx = self._raw_idx[idx]
