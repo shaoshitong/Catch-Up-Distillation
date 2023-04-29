@@ -38,7 +38,7 @@ def ddp_setup(rank, world_size,arg):
         world_size: Total number of processes
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = f"{12356+int(arg.gpu[0])}"
+    os.environ["MASTER_PORT"] = f"{12359+int(arg.gpu[0])}"
     # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
     # Windows
     # init_process_group(backend="gloo", rank=rank, world_size=world_size)
@@ -199,31 +199,31 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
                         # save
                         torch.save(d, os.path.join(dir, f"training_state_latest_2.pth"))  
                     i+=1
-            if rank == 0:
-                if use_ema:
-                    for j,ema_generator in enumerate(ema_generator_list):
-                        ema_generator.ema_swap(rectified_flow.generator_list[j])
-                    rectified_flow.ema_model.ema_swap(rectified_flow.model)
-                    torch.save(rectified_flow.model.module.state_dict(), os.path.join(dir, f"flow_model_update_{ii}_ema.pth"))
-                    if forward_model is not None:
-                        torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_update_{ii}_ema.pth"))
-                    rectified_flow.ema_model.ema_swap(rectified_flow.model)
-                    for j,ema_generator in enumerate(ema_generator_list):
-                        ema_generator.ema_swap(rectified_flow.generator_list[j])
-                else:
-                    torch.save(rectified_flow.model.state_dict(), os.path.join(dir, f"flow_model_update_{ii}_ema.pth"))
-                    if forward_model is not None:
-                        torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_update_{ii}_ema.pth"))
-                # Save training state
-                d = {}
-                d['optimizer_state_dict'] = optimizer.state_dict()
-                d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
-                d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
+        if rank == 0:
+            if use_ema:
+                for j,ema_generator in enumerate(ema_generator_list):
+                    ema_generator.ema_swap(rectified_flow.generator_list[j])
+                rectified_flow.ema_model.ema_swap(rectified_flow.model)
+                torch.save(rectified_flow.model.module.state_dict(), os.path.join(dir, f"flow_model_update_{ii}_ema.pth"))
                 if forward_model is not None:
-                    d['forward_model_state_dict'] = forward_model.module.state_dict()
-                d['iter'] = i
-                # save
-                torch.save(d, os.path.join(dir, f"training_state_{i}.pth"))  
+                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_update_{ii}_ema.pth"))
+                rectified_flow.ema_model.ema_swap(rectified_flow.model)
+                for j,ema_generator in enumerate(ema_generator_list):
+                    ema_generator.ema_swap(rectified_flow.generator_list[j])
+            else:
+                torch.save(rectified_flow.model.state_dict(), os.path.join(dir, f"flow_model_update_{ii}_ema.pth"))
+                if forward_model is not None:
+                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_update_{ii}_ema.pth"))
+            # Save training state
+            d = {}
+            d['optimizer_state_dict'] = optimizer.state_dict()
+            d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
+            d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
+            if forward_model is not None:
+                d['forward_model_state_dict'] = forward_model.module.state_dict()
+            d['iter'] = i
+            # save
+            torch.save(d, os.path.join(dir, f"training_state_{i}.pth"))  
 
     return rectified_flow
 
