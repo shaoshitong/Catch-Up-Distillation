@@ -11,7 +11,7 @@
         2,
         2
     ],
-    "channel_mult_emb": 4,
+    "channel_mult_emb": 4, 
     "num_blocks": 2,
     "attn_resolutions": [
         16

@@ -7,12 +7,13 @@
     "augment_dim": 0,
     "model_channels": 128,
     "channel_mult": [
+        1,
         2,
         2,
         2
     ],
     "channel_mult_emb": 4,
-    "num_blocks": 4,
+    "num_blocks": 8,
     "attn_resolutions": [
         16
     ],
