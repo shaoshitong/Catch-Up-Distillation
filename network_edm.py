@@ -262,14 +262,16 @@ class SongUNet(torch.nn.Module):
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
         prior_shakedrop     = False,        # If applying Prior ShakeDrop to the network.
-        phi                 = 0.3,          # Prior ShakeDrop probability.
+        phi                 = 0.25,          # Prior ShakeDrop probability.
         add_prior_z         = False,        # If adding the prior z to the output of the network. 
+        discrete_time       = False,        # Appling discrete time flow. 
+        total_N             = 16,           # The number of discrete time point
         **kwargs
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
         assert decoder_type in ['standard', 'skip']
-
+        print(f"phi is {phi}")
         super().__init__()
         self.config = {
             'img_resolution'    : img_resolution,
@@ -291,7 +293,9 @@ class SongUNet(torch.nn.Module):
             'resample_filter'   : resample_filter,
         }
         self.prior_shakedrop = prior_shakedrop
+        self.discrete_time = discrete_time
         self.add_prior_z = add_prior_z
+        self.total_N = total_N
         if self.prior_shakedrop:
             self.phi = phi
         self.label_dropout = label_dropout
@@ -307,7 +311,10 @@ class SongUNet(torch.nn.Module):
         )
 
         # Mapping.
-        self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
+        if self.discrete_time:
+            self.map_noise = torch.nn.Embedding(num_embeddings=self.total_N+1, embedding_dim=noise_channels)
+        else:
+            self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
         self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init) if label_dim else None
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
         self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)

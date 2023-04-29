@@ -6,6 +6,27 @@ python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3 \
       --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 \
       --optimizer adam --batchsize 128 --iterations 500000 \
       --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 2 --adapt_cu rule
+
+python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-sam-beta20/ \
+    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
+    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --sam
+
+python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-beta20/ \
+    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
+    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop
+
+python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-0.05-beta20/ \
+    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
+    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop --sam
+
+python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-0.5-large-discrete-beta20/ \
+    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
+    --config_en configs/cifar10_en.json --config_de configs/cifar10_large_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop --sam --discrete
+
+python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-0.05-beta20/ \
+    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
+    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop --sam
+
 """
 import torch
 import numpy as np
@@ -73,6 +94,7 @@ def get_args():
     parser.add_argument('--weight_prior', type=float, default = 10, help='Prior loss weight')
     parser.add_argument('--add_prior_z', action='store_true', help='Add prior z to model')
     parser.add_argument('--shakedrop', action = 'store_true', help='Using shakedrop')
+    parser.add_argument('--discrete_time', action = 'store_true', help='Using discrete catching-up distillation')
     parser.add_argument('--sam', action = 'store_true', help='Using Sharpness Aware Minimization')
     parser.add_argument('--loss_type', type=str, default = "mse", help='The loss type for the flow model, [mse, lpips, mse_lpips]')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
@@ -140,7 +162,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         if arg.sam:
             loss_sam = rectified_flow.L_sam
         else:
-            loss_sam = torch.Tensor([0.]).to(device)
+            loss_sam = torch.Tensor([0.]).to(device)[0]
         loss_fm+=loss_sam
         #################################### Choose the loss function ####################################
 
@@ -346,6 +368,8 @@ def main(rank: int, world_size: int, arg):
         pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
     config_de['prior_shakedrop'] = arg.shakedrop
     config_de['add_prior_z'] = arg.add_prior_z
+    config_de['discrete_time'] = arg.discrete_time
+    config_de['total_N'] = arg.N
     if config_de['unet_type'] == 'adm':
         model_class = UNetModel
     elif config_de['unet_type'] == 'songunet':
@@ -448,7 +472,7 @@ def main(rank: int, world_size: int, arg):
         if arg.resume is not None:
             ema_model.ema_model.module.load_state_dict(training_state['model_state_dict'][1])
 
-    rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,add_prior_z=arg.add_prior_z,adapt_cu=arg.adapt_cu,sam=arg.sam)
+    rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,add_prior_z=arg.add_prior_z,adapt_cu=arg.adapt_cu,sam=arg.sam,discrete=arg.discrete_time)
     if rank==0:
         print(f"Start training, with len(generator_list): {len(generator_list) if generator_list is not None else 0}, with adaptive_weight: {arg.adaptive_weight}")
         print(f"Iteration begin: {start_iter}, Iteration end: {now_iteration}, Iteration total: {now_iteration - start_iter}")

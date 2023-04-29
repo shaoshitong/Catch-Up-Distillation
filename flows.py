@@ -40,7 +40,7 @@ class BaseFlow():
     return traj
 
   @torch.no_grad()
-  def sample_ode_generative(self, z1=None, N=None, use_tqdm=True, solver = 'euler'):
+  def sample_ode_generative(self, z1=None, N=None, use_tqdm=True, solver = 'euler',momentum=0.0):
     model_fn = lambda z,t: self.model(z,t)
     assert solver in ['euler', 'heun']
     tq = tqdm if use_tqdm else lambda x: x
@@ -55,7 +55,7 @@ class BaseFlow():
     x0hat_list = []
     z = z1.detach().clone()
     batchsize = z.shape[0]
-    
+    vt = 0.
     traj.append(z.detach().clone())
     for i in tq(reversed(range(1,N+1))):
       t = torch.ones((batchsize,1), device=self.device) * i / N
@@ -63,14 +63,18 @@ class BaseFlow():
       if len(z1.shape) == 2:
         if solver == 'heun':
           raise NotImplementedError("Heun's method not implemented for 2D data.")
-        vt = model_fn(z, t)
+        _vt = model_fn(z, t)
       elif len(z1.shape) == 4:
-        vt = model_fn(z, t.squeeze())
+        _vt = model_fn(z, t.squeeze())
         if solver == 'heun':
           if i!=1:
-            z_next = z.detach().clone() + vt * dt
+            z_next = z.detach().clone() + _vt * dt
             vt_next = model_fn(z_next, t_next.squeeze())
-            vt = (vt + vt_next) / 2
+            _vt = (_vt + vt_next) / 2
+            if i==N:
+              vt = _vt.detach().clone()
+            else:
+              vt = _vt.detach().clone() *(1-momentum) + momentum * vt
         x0hat = z - vt * t.view(-1,1,1,1)
         x0hat_list.append(x0hat)
       
@@ -346,7 +350,7 @@ class ConsistencyFlow(RectifiedFlow):
   def __init__(self, device,model, ema_model,num_steps=1000,TN=16):
     self.ema_model = ema_model
     import copy
-    self.pre_train_model = copy.deepcopy(model)
+    self.pre_train_model = copy.deepcopy(ema_model)
     self.model = model
     self.N = num_steps
     self.TN = TN
@@ -371,11 +375,11 @@ class ConsistencyFlow(RectifiedFlow):
     pred_z_t = self.model(pre_z_t,t)
     with torch.no_grad():
       gt_z_t = self.ema_model(now_z_t,now_t)
-    return pred_z_t,gt_z_t
+    return pred_z_t, gt_z_t
   
 
 class OnlineSlimFlow(RectifiedFlow):
-  def __init__(self, device, model, ema_model, generator_list=None, num_steps=1000,TN=16,adapt_cu="origin",add_prior_z=False,sam=False):
+  def __init__(self, device, model, ema_model, generator_list=None, num_steps=1000,TN=16,adapt_cu="origin",add_prior_z=False,sam=False,discrete=False):
     self.ema_model = ema_model
     self.model = model
     self.sam = sam
@@ -383,6 +387,7 @@ class OnlineSlimFlow(RectifiedFlow):
     assert adapt_cu in ["origin","rule","uniform"],"adapt_cu must be one of 'origin','rule','uniform'."
     self.adapt_cu = adapt_cu
     self.add_prior_z = add_prior_z
+    self.discrete = discrete
     self.TN = TN
     self.device = device
     if generator_list == None:
@@ -396,15 +401,26 @@ class OnlineSlimFlow(RectifiedFlow):
   def get_train_tuple_one_step(self, z0=None, z1=None, t = None,eps=1e-5):
     ori_z = z1 if self.add_prior_z else None
     if t is None:
-      t = torch.rand((z0.shape[0],)).to(z1.device).float()
-      t = t*(1-eps)+eps
-    if self.adapt_cu=="uniform":
-      dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    elif self.adapt_cu=="rule":
-      dt = t * (1/self.TN)
+      if self.discrete:
+        t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+      else:
+        t = torch.rand((z0.shape[0],)).to(z1.device).float()
+        t = t*(1-eps)+eps
+    
+    if self.discrete:
+      if self.adapt_cu=="uniform":
+          dt = (torch.rand((z0.shape[0],)).to(z1.device).float() * t *self.TN).int().float()/self.TN
+      else:
+          dt = torch.ones((z0.shape[0],)).to(z1.device).float()/self.TN
+      mask = (t>=dt)
     else:
-      dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    mask = (t>=(eps+dt))
+      if self.adapt_cu=="uniform":
+        dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      elif self.adapt_cu=="rule":
+        dt = t * (1/self.TN)
+      else:
+        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      mask = (t>=(eps+dt))
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -415,14 +431,17 @@ class OnlineSlimFlow(RectifiedFlow):
       raise NotImplementedError(f"z1.shape should be 2 or 4.")
     
     ############################################## Train Model Prediction ###############################################
-    pred_z_t = self.model(pre_z_t,t,ori_z=ori_z)
+    pred_z_t = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
 
     ############################################## EMA Model Prediction #################################################
     with torch.no_grad():
-      now_z_t = pre_z_t - dt*self.model(pre_z_t,t,ori_z=ori_z)
+      now_z_t = pre_z_t - dt.view(dt.shape[0],1,1,1)*self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
       now_t = t - dt
-      now_t = now_t.clamp(eps,1)
-      ema_z_t = self.model(now_z_t,now_t,ori_z=ori_z)
+      if self.discrete:
+        now_t = now_t.clamp(1/self.TN,1)
+      else:
+        now_t = now_t.clamp(eps,1)
+      ema_z_t = self.model(now_z_t,(now_t*self.TN).int() if self.discrete else now_t,ori_z=ori_z)
       ema_z_t[~mask] = (z1-z0)[~mask]
     ############################################## Ground Truth #########################################################
     gt_z_t = z1 - z0
@@ -433,15 +452,24 @@ class OnlineSlimFlow(RectifiedFlow):
   def get_train_tuple_two_step(self, z0 = None, z1 = None, t = None,eps = 1e-5):
     ori_z = z1 if self.add_prior_z else None
     if t is None:
-      t = torch.rand((z0.shape[0],)).to(z1.device).float()
-      t = t*(1-eps)+eps
-    if self.adapt_cu=="uniform":
-      dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    elif self.adapt_cu=="rule":
-      dt = t * (1/self.TN)
+      if self.discrete:
+        t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+      else:
+        t = torch.rand((z0.shape[0],)).to(z1.device).float()
+        t = t*(1-eps)+eps
+    
+    if self.discrete:
+        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+        mask = (t>=2*dt)
     else:
-      dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    mask = (t>=(eps+2*dt))
+      if self.adapt_cu=="uniform":
+        dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      elif self.adapt_cu=="rule":
+        dt = t * (1/self.TN)
+      else:
+        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      mask = (t>=(eps+2*dt))
+
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -452,19 +480,19 @@ class OnlineSlimFlow(RectifiedFlow):
       raise NotImplementedError(f"z1.shape should be 2 or 4.")
     
     ############################################## Train Model Prediction ###############################################
-    pred_1_z_t,features = self.model(pre_z_t,t,return_features=True,ori_z=ori_z)
+    pred_1_z_t,features = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,return_features=True,ori_z=ori_z)
     pred_2_z_t = self.generator_list[0](features)
     pred_list = [pred_1_z_t,pred_2_z_t]
 
     ############################################## EMA Model Prediction #################################################
     with torch.no_grad():
-      h = dt
-      k1 = self.model(pre_z_t,t,ori_z=ori_z)
-      k2 = self.model(pre_z_t-h*k1,t-dt,ori_z=ori_z)
+      h = dt.view(dt.shape[0],1,1,1)
+      k1 = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
+      k2 = self.model(pre_z_t-h*k1,(t*self.TN-1).int() if self.discrete else t-dt,ori_z=ori_z)
       ema_1_z_t = pre_z_t - h*((1/2)*k1+(1/2)*k2)
       ema_2_z_t = pre_z_t - h*(k1+k2)
-      ema_1_z_t = self.model(ema_1_z_t,torch.clamp(t-dt,eps,1),ori_z=ori_z)
-      ema_2_z_t = self.model(ema_2_z_t,torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
+      ema_1_z_t = self.model(ema_1_z_t,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-dt,eps,1),ori_z=ori_z)
+      ema_2_z_t = self.model(ema_2_z_t,(t*self.TN-2).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
       ema_1_z_t[~mask] = (z1-z0)[~mask]
       ema_2_z_t[~mask] = (z1-z0)[~mask]
       ema_list = [ema_1_z_t,ema_2_z_t]
@@ -476,15 +504,24 @@ class OnlineSlimFlow(RectifiedFlow):
   def get_train_tuple_three_step(self, z0=None, z1=None, t = None,eps=1e-5):
       ori_z = z1 if self.add_prior_z else None
       if t is None:
-        t = torch.rand((z0.shape[0],)).to(z1.device).float()
-        t = t*(1-eps)+eps
-      if self.adapt_cu=="uniform":
-        dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-      elif self.adapt_cu=="rule":
-        dt = t * (1/self.TN)
+        if self.discrete:
+          t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+        else:
+          t = torch.rand((z0.shape[0],)).to(z1.device).float()
+          t = t*(1-eps)+eps
+      
+      if self.discrete:
+          dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+          mask = (t>=3*dt)
       else:
-        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-      mask = (t>=(eps+3*dt))
+        if self.adapt_cu=="uniform":
+          dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+        elif self.adapt_cu=="rule":
+          dt = t * (1/self.TN)
+        else:
+          dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+        mask = (t>=(eps+3*dt))
+        
       if len(z1.shape) == 2:
         pre_z_t =  t * z1 + (1.-t) * z0
       elif len(z1.shape) == 4:
@@ -494,23 +531,23 @@ class OnlineSlimFlow(RectifiedFlow):
       else:
         raise NotImplementedError(f"z1.shape should be 2 or 4.")
       ############################################## Train Model Prediction ###############################################
-      pred_1_z_t,features = self.model(pre_z_t,t,return_features=True,ori_z=ori_z)
+      pred_1_z_t,features = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,return_features=True,ori_z=ori_z)
       pred_2_z_t = self.generator_list[0](features)
       pred_3_z_t = self.generator_list[1](features)
       pred_list = [pred_1_z_t,pred_2_z_t,pred_3_z_t]
 
       ############################################## EMA Model Prediction #################################################
       with torch.no_grad():
-        h = dt
-        k1 = self.model(pre_z_t,t,ori_z=ori_z)
-        k2 = self.model(pre_z_t-h*k1,torch.clamp(t-dt,eps,1),ori_z=ori_z)
-        k3 = self.model(pre_z_t-(7*h*k1/4+1*h*k2/4),torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
+        h = dt.view(dt.shape[0],1,1,1)
+        k1 = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
+        k2 = self.model(pre_z_t-h*k1,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-dt,eps,1),ori_z=ori_z)
+        k3 = self.model(pre_z_t-(7*h*k1/4+1*h*k2/4),(t*self.TN-2).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
         ema_1_z_t = pre_z_t - h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
         ema_2_z_t = pre_z_t - 2*h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
         ema_3_z_t = pre_z_t - 3*h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
-        ema_1_z_t = self.model(ema_1_z_t,torch.clamp(t-1*dt,eps,1),ori_z=ori_z)
-        ema_2_z_t = self.model(ema_2_z_t,torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
-        ema_3_z_t = self.model(ema_3_z_t,torch.clamp(t-3*dt,eps,1),ori_z=ori_z)
+        ema_1_z_t = self.model(ema_1_z_t,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-1*dt,eps,1),ori_z=ori_z)
+        ema_2_z_t = self.model(ema_2_z_t,(t*self.TN-2).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
+        ema_3_z_t = self.model(ema_3_z_t,(t*self.TN-3).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-3*dt,eps,1),ori_z=ori_z)
         ema_1_z_t[~mask] = (z1-z0)[~mask]
         ema_2_z_t[~mask] = (z1-z0)[~mask]
         ema_3_z_t[~mask] = (z1-z0)[~mask]
@@ -556,16 +593,15 @@ class OnlineSlimFlow(RectifiedFlow):
     else:
       raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
     target = z1 - z0
-    pred = z1 - self.model(z_t,t)
+    pred = self.model(z_t,(t*self.TN).int() if self.discrete else t)
     return pred - target
   
   @torch.no_grad()
-  def sample_ode_generative(self, z1=None, N=None, use_tqdm=True, solver = 'euler'):
-    if self.add_prior_z:
-      model_fn = lambda z,t:self.model(z,t,ori_z = z1)
-    else:
+  def sample_ode_generative(self, z1=None, N=None, use_tqdm=True, solver = 'euler',momentum=0.0,generator_id=1):
+    if generator_id == 1:
       model_fn = lambda z,t: self.model(z,t)
-    
+    else:
+      model_fn = lambda z,t: self.generator_list[generator_id-2](self.model(z,t,return_features=True)[1])
     assert solver in ['euler', 'heun']
     tq = tqdm if use_tqdm else lambda x: x
     if N is None:
@@ -579,7 +615,7 @@ class OnlineSlimFlow(RectifiedFlow):
     x0hat_list = []
     z = z1.detach().clone()
     batchsize = z.shape[0]
-    
+    vt = 0.
     traj.append(z.detach().clone())
     for i in tq(reversed(range(1,N+1))):
       t = torch.ones((batchsize,1), device=self.device) * i / N
@@ -587,18 +623,21 @@ class OnlineSlimFlow(RectifiedFlow):
       if len(z1.shape) == 2:
         if solver == 'heun':
           raise NotImplementedError("Heun's method not implemented for 2D data.")
-        vt = model_fn(z, t)
+        _vt = model_fn(z, t)
       elif len(z1.shape) == 4:
-        vt = model_fn(z, t.squeeze())
+        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
         if solver == 'heun':
           if i!=1:
-            z_next = z.detach().clone() + vt * dt
-            vt_next = model_fn(z_next, t_next.squeeze())
-            vt = (vt + vt_next) / 2
+            z_next = z.detach().clone() + _vt * dt
+            vt_next = model_fn(z_next, (t_next*self.TN).int().squeeze() if self.discrete else t_next.squeeze())
+            _vt = (_vt + vt_next) / 2
+        if i==N:
+          vt = _vt.detach().clone()
+        else:
+          vt = _vt.detach().clone() *(1-momentum) + momentum * vt
         x0hat = z - vt * t.view(-1,1,1,1)
         x0hat_list.append(x0hat)
       
-        
       z = z.detach().clone() + vt * dt
       
       traj.append(z.detach().clone())
@@ -619,9 +658,9 @@ class OnlineSlimFlow(RectifiedFlow):
     for i in range(N):
       t = torch.ones((batchsize,1), device=self.device) * i / N
       if len(z0.shape) == 2:
-        pred = self.model(z, t,ori_z=ori_z)
+        pred = self.model(z, (t*self.TN).int() if self.discrete else t ,ori_z=ori_z)
       elif len(z0.shape) == 4:
-        pred = self.model(z, t.squeeze(),ori_z=ori_z)
+        pred = self.model(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze(),ori_z=ori_z)
       z = z.detach().clone() + pred * dt
       
       traj.append(z.detach().clone())
@@ -630,15 +669,23 @@ class OnlineSlimFlow(RectifiedFlow):
   def get_train_tuple_sam_one_step(self, z0=None, z1=None, t = None,eps=1e-5):
     ori_z = z1 if self.add_prior_z else None
     if t is None:
-      t = torch.rand((z0.shape[0],)).to(z1.device).float()
-      t = t*(1-eps)+eps
-    if self.adapt_cu=="uniform":
-      dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    elif self.adapt_cu=="rule":
-      dt = t * (1/self.TN)
+      if self.discrete:
+        t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+      else:
+        t = torch.rand((z0.shape[0],)).to(z1.device).float()
+        t = t*(1-eps)+eps
+    
+    if self.discrete:
+        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+        mask = (t>=dt)
     else:
-      dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    mask = (t>=(eps+dt))
+      if self.adapt_cu=="uniform":
+        dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      elif self.adapt_cu=="rule":
+        dt = t * (1/self.TN)
+      else:
+        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      mask = (t>=(eps+dt))
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -649,29 +696,50 @@ class OnlineSlimFlow(RectifiedFlow):
       raise NotImplementedError(f"z1.shape should be 2 or 4.")
     
     ############################################## Train Model Prediction ###############################################
-    pred_z_t = self.model(pre_z_t,t,ori_z=ori_z)
+    pred_z_t = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
 
     ############################################## EMA Model Prediction #################################################
     with torch.no_grad():
-      now_v = dt*self.model(pre_z_t,t,ori_z=ori_z)
-      now_z_t = pre_z_t - now_v
+      now_z_t = pre_z_t - dt.view(dt.shape[0],1,1,1)*pred_z_t
       now_t = t - dt
-      now_t = now_t.clamp(eps,1)
-      ema_z_t = self.model(now_z_t,now_t,ori_z=ori_z)
+      if self.discrete:
+        now_t = now_t.clamp(1/self.TN,1)
+      else:
+        now_t = now_t.clamp(eps,1)
+      ema_z_t = self.model(now_z_t,(now_t*self.TN).int() if self.discrete else now_t,ori_z=ori_z)
       ema_z_t[~mask] = (z1-z0)[~mask]
-
     ############################################## Ground Truth #########################################################
     gt_z_t = z1 - z0
 
-    ############################################## Compute SAM ##########################################################
+    ################n############################## Compute SAM ##########################################################
+    # with torch.no_grad():
+    #   d_eps = torch.ones_like(dt) * eps
+    #   sam_v = self.model(pre_z_t-pred_z_t*d_eps,t,ori_z=ori_z)
+    #   sam_z_t = pre_z_t - d_eps.view(dt.shape[0],1,1,1)*sam_v
+    #   now_z_t = pre_z_t - d_eps.view(dt.shape[0],1,1,1)*pred_z_t
+    #   sam_now_t = t - d_eps
+    #   sam_now_t = sam_now_t.clamp(eps,1)
+
+    #   ema_z_t = self.model(now_z_t,sam_now_t,ori_z=ori_z)
+    #   ema_z_t[~mask] = (z1-z0)[~mask]
+    # sam_z_t = self.model(sam_z_t,sam_now_t,ori_z=ori_z)
+    # sam_z_t[~mask] = (z1-z0)[~mask]
+
+    # weight = 1
+    # if not self.sam_control:
+    #   L_sam = weight * (sam_z_t - ema_z_t)**2/((pred_z_t.detach())**2+eps)
+    # else:
+    #   L_sam = weight * (sam_z_t - ema_z_t)**2
+    # L_sam = L_sam.mean()
+    # self.L_sam = L_sam
     with torch.no_grad():
-      sam_v = self.model(now_z_t,t,ori_z=ori_z)
-      sam_z_t = pre_z_t - dt*sam_v
-    
-    sam_z_t = self.model(sam_z_t,now_t,ori_z=ori_z)
-    sam_z_t[~mask] = (z1-z0)[~mask]
-    L_sam = dt*(sam_z_t - ema_z_t)/(pre_z_t)
-    L_sam = L_sam.pow(2).mean().sqrt()
+      pre_z_t_h = pre_z_t.detach() - (z1-z0)*dt.view(dt.shape[0],1,1,1)
+      sam_z_t = pre_z_t - dt.view(dt.shape[0],1,1,1)*pred_z_t + dt.view(dt.shape[0],1,1,1)*self.model(pre_z_t_h,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else t-dt,ori_z=ori_z)
+      sam_z_t[~mask] = (pre_z_t)[~mask]
+      sam_v_t = self.model(sam_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
+    weight = 0.5
+    L_sam = weight * (sam_v_t - pred_z_t)**2
+    L_sam = L_sam.mean()
     self.L_sam = L_sam
 
     return pred_z_t, ema_z_t, gt_z_t
@@ -679,15 +747,24 @@ class OnlineSlimFlow(RectifiedFlow):
   def get_train_tuple_sam_two_step(self, z0 = None, z1 = None, t = None,eps = 1e-5):
     ori_z = z1 if self.add_prior_z else None
     if t is None:
-      t = torch.rand((z0.shape[0],)).to(z1.device).float()
-      t = t*(1-eps)+eps
-    if self.adapt_cu=="uniform":
-      dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    elif self.adapt_cu=="rule":
-      dt = t * (1/self.TN)
+      if self.discrete:
+        t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+      else:
+        t = torch.rand((z0.shape[0],)).to(z1.device).float()
+        t = t*(1-eps)+eps
+    
+    if self.discrete:
+        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+        mask = (t>=2*dt)
     else:
-      dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-    mask = (t>=(eps+2*dt))
+      if self.adapt_cu=="uniform":
+        dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      elif self.adapt_cu=="rule":
+        dt = t * (1/self.TN)
+      else:
+        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+      mask = (t>=(eps+2*dt))
+
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -698,34 +775,44 @@ class OnlineSlimFlow(RectifiedFlow):
       raise NotImplementedError(f"z1.shape should be 2 or 4.")
     
     ############################################## Train Model Prediction ###############################################
-    pred_1_z_t,features = self.model(pre_z_t,t,return_features=True,ori_z=ori_z)
+    pred_1_z_t,features = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,return_features=True,ori_z=ori_z)
     pred_2_z_t = self.generator_list[0](features)
     pred_list = [pred_1_z_t,pred_2_z_t]
 
     ############################################## EMA Model Prediction #################################################
     with torch.no_grad():
-      h = dt
-      k1 = self.model(pre_z_t,t,ori_z=ori_z)
-      k2 = self.model(pre_z_t-h*k1,t-dt,ori_z=ori_z)
+      h = dt.view(dt.shape[0],1,1,1)
+      k1= pred_1_z_t
+      k2 = self.model(pre_z_t-h*k1,(t*self.TN-1).int() if self.discrete else t-dt,ori_z=ori_z)
       ema_1_z_t = pre_z_t - h*((1/2)*k1+(1/2)*k2)
       ema_2_z_t = pre_z_t - h*(k1+k2)
-      ema_1_z_t = self.model(ema_1_z_t,torch.clamp(t-dt,eps,1),ori_z=ori_z)
-      ema_2_z_t = self.model(ema_2_z_t,torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
+      ema_1_z_t = self.model(ema_1_z_t,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-dt,eps,1),ori_z=ori_z)
+      ema_2_z_t = self.model(ema_2_z_t,(t*self.TN-2).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
       ema_1_z_t[~mask] = (z1-z0)[~mask]
       ema_2_z_t[~mask] = (z1-z0)[~mask]
       ema_list = [ema_1_z_t,ema_2_z_t]
     ############################################## GT ##################################################################
-    gt_z_t = z1 - z0 
+    gt_z_t = z1 - z0
 
     ############################################## Compute SAM ##########################################################
+    # with torch.no_grad():
+    #   sam_v = self.model(ema_1_z_t,t,ori_z=ori_z)
+    #   sam_z_t = pre_z_t - h*((1/2)*sam_v+(1/2)*k2)
+    #   sam_z_t = self.model(sam_z_t,torch.clamp(t-dt,eps,1),ori_z=ori_z)
+    #   sam_z_t[~mask] = (z1-z0)[~mask]
+
+    # L_sam = (dt*(sam_z_t - ema_1_z_t))**2/((pred_1_z_t.detach())**2+eps)
+    # L_sam = L_sam.mean().sqrt()
+    # self.L_sam = L_sam
+
     with torch.no_grad():
-      sam_v = self.model(ema_1_z_t,t,ori_z=ori_z)
-      sam_z_t = pre_z_t - h*((1/2)*sam_v+(1/2)*k2)
-    
-    sam_z_t = self.model(sam_z_t,torch.clamp(t-dt,eps,1),ori_z=ori_z)
-    sam_z_t[~mask] = (z1-z0)[~mask]
-    L_sam = dt*(sam_z_t - ema_1_z_t)/(pre_z_t)
-    L_sam = L_sam.pow(2).mean().sqrt()
+      pre_z_t_h = pre_z_t.detach() - (z1-z0)*dt.view(dt.shape[0],1,1,1)
+      sam_z_t = pre_z_t - dt.view(dt.shape[0],1,1,1)*pred_1_z_t + dt.view(dt.shape[0],1,1,1)*self.model(pre_z_t_h,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else t-dt,ori_z=ori_z)
+      sam_z_t[~mask] = (pre_z_t)[~mask]
+      sam_v_t = self.model(sam_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
+    weight = 0.5
+    L_sam = weight * (sam_v_t - pred_1_z_t)**2
+    L_sam = L_sam.mean()
     self.L_sam = L_sam
 
     return pred_list, ema_list, gt_z_t
@@ -733,15 +820,24 @@ class OnlineSlimFlow(RectifiedFlow):
   def get_train_tuple_sam_three_step(self, z0=None, z1=None, t = None,eps=1e-5):
       ori_z = z1 if self.add_prior_z else None
       if t is None:
-        t = torch.rand((z0.shape[0],)).to(z1.device).float()
-        t = t*(1-eps)+eps
-      if self.adapt_cu=="uniform":
-        dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-      elif self.adapt_cu=="rule":
-        dt = t * (1/self.TN)
+        if self.discrete:
+          t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+        else:
+          t = torch.rand((z0.shape[0],)).to(z1.device).float()
+          t = t*(1-eps)+eps
+      
+      if self.discrete:
+          dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+          mask = (t>=3*dt)
       else:
-        dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
-      mask = (t>=(eps+3*dt))
+        if self.adapt_cu=="uniform":
+          dt = torch.rand((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+        elif self.adapt_cu=="rule":
+          dt = t * (1/self.TN)
+        else:
+          dt = torch.ones((z0.shape[0],)).to(z1.device).float() * (1/self.TN)
+        mask = (t>=(eps+3*dt))
+        
       if len(z1.shape) == 2:
         pre_z_t =  t * z1 + (1.-t) * z0
       elif len(z1.shape) == 4:
@@ -751,23 +847,23 @@ class OnlineSlimFlow(RectifiedFlow):
       else:
         raise NotImplementedError(f"z1.shape should be 2 or 4.")
       ############################################## Train Model Prediction ###############################################
-      pred_1_z_t,features = self.model(pre_z_t,t,return_features=True,ori_z=ori_z)
+      pred_1_z_t,features = self.model(pre_z_t,(t*self.TN).int() if self.discrete else t,return_features=True,ori_z=ori_z)
       pred_2_z_t = self.generator_list[0](features)
       pred_3_z_t = self.generator_list[1](features)
       pred_list = [pred_1_z_t,pred_2_z_t,pred_3_z_t]
 
       ############################################## EMA Model Prediction #################################################
       with torch.no_grad():
-        h = dt
-        k1 = self.model(pre_z_t,t,ori_z=ori_z)
-        k2 = self.model(pre_z_t-h*k1,torch.clamp(t-dt,eps,1),ori_z=ori_z)
-        k3 = self.model(pre_z_t-(7*h*k1/4+1*h*k2/4),torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
+        h = dt.view(dt.shape[0],1,1,1)
+        k1 = pred_1_z_t
+        k2 = self.model(pre_z_t-h*k1,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-dt,eps,1),ori_z=ori_z)
+        k3 = self.model(pre_z_t-(7*h*k1/4+1*h*k2/4),(t*self.TN-2).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
         ema_1_z_t = pre_z_t - h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
         ema_2_z_t = pre_z_t - 2*h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
         ema_3_z_t = pre_z_t - 3*h*((5/12)*k1+(2/3)*k2-(1/12)*k3)
-        ema_1_z_t = self.model(ema_1_z_t,torch.clamp(t-1*dt,eps,1),ori_z=ori_z)
-        ema_2_z_t = self.model(ema_2_z_t,torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
-        ema_3_z_t = self.model(ema_3_z_t,torch.clamp(t-3*dt,eps,1),ori_z=ori_z)
+        ema_1_z_t = self.model(ema_1_z_t,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-1*dt,eps,1),ori_z=ori_z)
+        ema_2_z_t = self.model(ema_2_z_t,(t*self.TN-2).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-2*dt,eps,1),ori_z=ori_z)
+        ema_3_z_t = self.model(ema_3_z_t,(t*self.TN-3).int().clamp(1,self.TN) if self.discrete else torch.clamp(t-3*dt,eps,1),ori_z=ori_z)
         ema_1_z_t[~mask] = (z1-z0)[~mask]
         ema_2_z_t[~mask] = (z1-z0)[~mask]
         ema_3_z_t[~mask] = (z1-z0)[~mask]
@@ -777,14 +873,25 @@ class OnlineSlimFlow(RectifiedFlow):
       gt_z_t = z1 - z0 
 
       ############################################## Compute SAM ##########################################################
-      with torch.no_grad():
-        sam_v = self.model(ema_1_z_t,t,ori_z=ori_z)
-        sam_z_t = pre_z_t - h*((5/12)*sam_v+(2/3)*k2-(1/12)*k3)
+      # with torch.no_grad():
+      #   sam_v = self.model(ema_1_z_t,t,ori_z=ori_z)
+      #   sam_z_t = pre_z_t - h*((5/12)*sam_v+(2/3)*k2-(1/12)*k3)
+      #   sam_z_t = self.model(sam_z_t,torch.clamp(t-dt,eps,1),ori_z=ori_z)
+      #   sam_z_t[~mask] = (z1-z0)[~mask]
+
+      # L_sam = (dt*(sam_z_t - ema_1_z_t))**2/((pred_1_z_t.detach())**2+eps)
+      # L_sam = L_sam.mean().sqrt()
+      # self.L_sam = L_sam
       
-      sam_z_t = self.model(sam_z_t,torch.clamp(t-dt,eps,1),ori_z=ori_z)
-      sam_z_t[~mask] = (z1-z0)[~mask]
-      L_sam = dt*(sam_z_t - ema_1_z_t)/(pre_z_t)
-      L_sam = L_sam.pow(2).mean().sqrt()
+      with torch.no_grad():
+        pre_z_t_h = pre_z_t.detach() - (z1-z0)*dt.view(dt.shape[0],1,1,1)
+        sam_z_t = pre_z_t - dt.view(dt.shape[0],1,1,1)*pred_1_z_t + dt.view(dt.shape[0],1,1,1)*self.model(pre_z_t_h,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else t-dt,ori_z=ori_z)
+        sam_z_t[~mask] = (pre_z_t)[~mask]
+        sam_v_t = self.model(sam_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
+      weight = 0.5
+      L_sam = weight * (sam_v_t - pred_1_z_t)**2
+      L_sam = L_sam.mean()
       self.L_sam = L_sam
+
     
       return pred_list, ema_list, gt_z_t

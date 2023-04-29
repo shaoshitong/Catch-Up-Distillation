@@ -126,7 +126,6 @@ def create_model_and_diffusion(
     )
     return model, diffusion
 
-
 def create_model(
     image_size,
     num_channels,
@@ -182,6 +181,7 @@ def create_model(
         resblock_updown=resblock_updown,
         use_new_attention_order=use_new_attention_order,
     )
+
 
 
 def create_classifier_and_diffusion(

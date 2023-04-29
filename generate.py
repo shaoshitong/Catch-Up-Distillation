@@ -15,7 +15,7 @@ from utils import straightness,convert_ddp_state_dict_to_single,straightness_no_
 from dataset import CelebAHQImgDataset
 import argparse
 from tqdm import tqdm
-from network_edm import SongUNet
+from network_edm import SongUNet,MetaGenerator
 from torch.nn import DataParallel
 import json
 from train_reverse_img_ddp import parse_config
@@ -39,14 +39,17 @@ def get_args():
     parser.add_argument('--save_sub_traj', action='store_true', help='Save the sub trajectories')   
     parser.add_argument('--save_z', action='store_true', help='Save zs for distillation')    
     parser.add_argument('--save_data', action='store_true', help='Save data')    
-    parser.add_argument('--solver', type=str, default = 'euler', help='ODE solvers')
+    parser.add_argument('--solver', type=str, default = 'euler', help='ODE solvers [euler, heun, rk]')
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
-    parser.add_argument('--rtol', type=float, default=1e-5, help='rtol for RK45 solver')
-    parser.add_argument('--atol', type=float, default=1e-5, help='atol for RK45 solver')
-    
-
+    parser.add_argument('--rtol', type=float, default=1e-3, help='rtol for RK45 solver')
+    parser.add_argument('--atol', type=float, default=1e-3, help='atol for RK45 solver')
+    parser.add_argument('--momentum', type=float, default=0.0, help='momentum for Euler/Heun solver')
+    parser.add_argument('--phi', type=float, default=0.25)
+    parser.add_argument('--shakedrop', action='store_true', help='Use shakedrop')
+    parser.add_argument('--generator', default=1, type=int, help='generator')
+    parser.add_argument('--generator_path', default="", type=str, help='generator path')
 
     arg = parser.parse_args()
     return arg
@@ -57,8 +60,8 @@ def main(arg):
         os.makedirs(arg.dir)
     assert arg.config_de is not None
     config = parse_config(arg.config_de)
-
-
+    config['prior_shakedrop'] = arg.shakedrop
+    config['phi'] = arg.phi
     if not os.path.exists(os.path.join(arg.dir, "samples")):
         os.makedirs(os.path.join(arg.dir, "samples"))
     if not os.path.exists(os.path.join(arg.dir, "zs")):
@@ -103,9 +106,25 @@ def main(arg):
 
     
     flow_model = flow_model.to(device)
-
-
-    rectified_flow = OnlineSlimFlow(device, flow_model, flow_model, None, num_steps = arg.N,add_prior_z=False,)
+    if arg.generator == 1:
+        generator_list = None
+    else:
+        ckpt = torch.load(arg.generator_path, map_location = "cpu")
+        generator_list = []
+        for i in range(len(ckpt)):
+            meta_generator = MetaGenerator(in_channel=flow_model.meta_in_channel, out_channel=flow_model.meta_out_channel)
+            meta_generator = meta_generator.to(device)
+            meta_generator.load_state_dict(convert_ddp_state_dict_to_single(ckpt[i]))
+            if len(device_ids) > 1:
+                device = torch.device(f"cuda")
+                print(f"Using {device_ids} GPUs!")
+                meta_generator = DataParallel(meta_generator)
+            else:
+                device = torch.device(f"cuda")
+            meta_generator.eval()
+            generator_list.append(meta_generator)
+        
+    rectified_flow = OnlineSlimFlow(device, flow_model, flow_model, generator_list, num_steps = arg.N,add_prior_z=False)
 
     rectified_flow.model.eval()
 
@@ -156,7 +175,7 @@ def main(arg):
             z_norm_list.append(z_norm)
             save_image(z, "debug2.jpg")
             if arg.solver in ['euler', 'heun']:
-                traj_uncond, traj_uncond_x0 = rectified_flow.sample_ode_generative(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver)
+                traj_uncond, traj_uncond_x0 = rectified_flow.sample_ode_generative(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver,momentum=arg.momentum,generator_id=arg.generator)
                 x0 = traj_uncond[-1]
                 uncond_straightness = straightness_no_mean(traj_uncond)
                 straightness_list.append(uncond_straightness)
@@ -165,7 +184,7 @@ def main(arg):
                 nfes.append(nfe)
                 # print(f"nfe: {nfe}")
 
-            if arg.save_traj:
+            if arg.save_traj and arg.solver in ['euler', 'heun']:
                 if len(traj_uncond_x0) > 10:
                     interval = len(traj_uncond_x0) // 5
                     grid = torch.cat(traj_uncond_x0[::interval], dim=3)
@@ -185,15 +204,16 @@ def main(arg):
                     np.save(os.path.join(arg.dir, "zs", f"{i:05d}.npy"), z[idx].cpu().numpy())
                 if arg.save_data:
                     save_image(x[idx] * 0.5 + 0.5 if not arg.no_scale else x[idx], os.path.join(arg.dir, "data", f"{i:05d}.png"))
-                if arg.save_sub_traj:
+                if arg.save_sub_traj and arg.solver in ['euler', 'heun']:
                     for mm,trag_sub_x0 in enumerate(traj_uncond_x0):
                         save_image(trag_sub_x0[idx]* 0.5 + 0.5 if not arg.no_scale else trag_sub_x0[idx], os.path.join(arg.dir, f"trajs_{mm}", f"{i:05d}.png"))
                 i+=1
                 if i >= arg.num_samples:
                     break
             x0_list.append(x0)
-        straightness_list = torch.stack(straightness_list).mean(dim=0).tolist()
-        print(f"cosine list: {straightness_list}")
+        if arg.solver in ['euler', 'heun']:
+            straightness_list = torch.stack(straightness_list).mean(dim=0).tolist()
+            print(f"cosine list: {straightness_list}")
         nfes_mean = np.mean(nfes) if len(nfes) > 0 else arg.N
         print(f"nfes_mean: {nfes_mean}")
         

@@ -1,9 +1,9 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """                                                                                                             
-python train_consistency_reverse_img_ddp.py --N 16 --gpu 4,5,6,7 --dir ./runs/cifar10-consistency2-beta20/ \
---weight_prior 20 --learning_rate 1e-2 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 64 --iterations 600000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json \
- --pretrain ./runs/cifar10-beta20/flow_model_500000_ema.pth --preforward ./runs/cifar10-beta20/forward_model_500000_ema.pth --loss_type lpips --resume ./runs/cifar10-consistency2-beta20/training_state_latest.pth
+python train_consistency_reverse_img_ddp.py --N 16 --gpu 0,1,2,3 --dir ./runs/cifar10-consistency-mse-16-beta20/ \
+--weight_prior 20 --learning_rate 1e-2 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 128 --iterations 600000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json \
+ --pretrain ./runs/cifar10-beta20/flow_model_500000_ema.pth --preforward ./runs/cifar10-beta20/forward_model_500000_ema.pth --independent
 """
 import torch
 import numpy as np
@@ -109,7 +109,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         loss = loss_fm + weight_prior * loss_prior
         loss.backward()
         optimizer.step()
-        rectified_flow.ema_model.ema_step(decay_rate=0.9999,model=rectified_flow.model)
+        rectified_flow.ema_model.ema_step(decay_rate=0.99999,model=rectified_flow.model)
 
         
         # Gather loss from all processes using torch.distributed.all_gather
@@ -126,7 +126,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             with open(os.path.join(dir, 'log.txt'), 'a') as f:
                 f.write(f"Iteration {i}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
 
-        if i % 10000 == 1 and rank == 0:
+        if i % 1000 == 1 and rank == 0:
             rectified_flow.model.eval()
             if use_ema:
                 rectified_flow.ema_model.ema_swap(rectified_flow.model)
