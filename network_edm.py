@@ -312,7 +312,8 @@ class SongUNet(torch.nn.Module):
 
         # Mapping.
         if self.discrete_time:
-            self.map_noise = torch.nn.Embedding(num_embeddings=self.total_N+1, embedding_dim=noise_channels)
+            self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
+            # self.map_noise = torch.nn.Embedding(num_embeddings=self.total_N+1, embedding_dim=noise_channels)
         else:
             self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
         self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init) if label_dim else None
@@ -374,6 +375,8 @@ class SongUNet(torch.nn.Module):
 
     def forward(self, x, noise_labels, class_labels = None, augment_labels=None,return_features=False,ori_z=None):
         # Mapping.
+        if self.discrete_time:
+            noise_labels = noise_labels/self.total_N
         emb = self.map_noise(noise_labels)
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
         if self.map_label is not None:

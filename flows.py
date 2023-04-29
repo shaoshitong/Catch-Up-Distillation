@@ -712,29 +712,10 @@ class OnlineSlimFlow(RectifiedFlow):
     gt_z_t = z1 - z0
 
     ################n############################## Compute SAM ##########################################################
-    # with torch.no_grad():
-    #   d_eps = torch.ones_like(dt) * eps
-    #   sam_v = self.model(pre_z_t-pred_z_t*d_eps,t,ori_z=ori_z)
-    #   sam_z_t = pre_z_t - d_eps.view(dt.shape[0],1,1,1)*sam_v
-    #   now_z_t = pre_z_t - d_eps.view(dt.shape[0],1,1,1)*pred_z_t
-    #   sam_now_t = t - d_eps
-    #   sam_now_t = sam_now_t.clamp(eps,1)
-
-    #   ema_z_t = self.model(now_z_t,sam_now_t,ori_z=ori_z)
-    #   ema_z_t[~mask] = (z1-z0)[~mask]
-    # sam_z_t = self.model(sam_z_t,sam_now_t,ori_z=ori_z)
-    # sam_z_t[~mask] = (z1-z0)[~mask]
-
-    # weight = 1
-    # if not self.sam_control:
-    #   L_sam = weight * (sam_z_t - ema_z_t)**2/((pred_z_t.detach())**2+eps)
-    # else:
-    #   L_sam = weight * (sam_z_t - ema_z_t)**2
-    # L_sam = L_sam.mean()
-    # self.L_sam = L_sam
     with torch.no_grad():
       pre_z_t_h = pre_z_t.detach() - (z1-z0)*dt.view(dt.shape[0],1,1,1)
-      sam_z_t = pre_z_t - dt.view(dt.shape[0],1,1,1)*pred_z_t + dt.view(dt.shape[0],1,1,1)*self.model(pre_z_t_h,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else t-dt,ori_z=ori_z)
+      sam_z_t = pre_z_t - dt.view(dt.shape[0],1,1,1)*pred_z_t + \
+        dt.view(dt.shape[0],1,1,1)*self.model(pre_z_t_h,(t*self.TN-1).int().clamp(1,self.TN) if self.discrete else t-dt,ori_z=ori_z)
       sam_z_t[~mask] = (pre_z_t)[~mask]
       sam_v_t = self.model(sam_z_t,(t*self.TN).int() if self.discrete else t,ori_z=ori_z)
     weight = 0.5

@@ -141,7 +141,38 @@ def calc(image_path, ref_path, num_expected, seed, batch):
             f.write(str(fid))
     torch.distributed.barrier()
 
-#----------------------------------------------------------------------------
+@main.command(name='calc_multiple')
+@click.option('--images', 'image_paths', help='Path to the images', metavar='PATH|ZIP',              type=click.Path(exists=True), multiple=True, required=True)
+@click.option('--ref', 'ref_path',      help='Dataset reference statistics ', metavar='NPZ|URL',    type=str, required=True)
+@click.option('--num', 'num_expected',  help='Number of images to use', metavar='INT',              type=click.IntRange(min=2), default=50000, show_default=True)
+@click.option('--seed',                 help='Random seed for selecting the images', metavar='INT', type=int, default=0, show_default=True)
+@click.option('--batch',                help='Maximum batch size', metavar='INT',                   type=click.IntRange(min=1), default=64, show_default=True)
+
+def calc_multiple(image_paths, ref_path, num_expected, seed, batch):
+    """Calculate FID for a given set of images."""
+    torch.multiprocessing.set_start_method('spawn')
+    os.environ['MASTER_PORT'] = f"{29500+ int(os.environ['CUDA_VISIBLE_DEVICES'])+1}"
+    print(os.environ['MASTER_PORT'])
+    dist.init()
+    dist.print0(f'Loading dataset reference statistics from "{ref_path}"...')
+    ref = None
+    if dist.get_rank() == 0:
+        with dnnlib.util.open_url(ref_path) as f:
+            ref = dict(np.load(f))
+
+    fids = []
+    for image_path in image_paths:
+        mu, sigma = calculate_inception_stats(image_path=image_path, num_expected=num_expected, seed=seed, max_batch_size=batch)
+        dist.print0(f'Calculating FID for images in {image_path}...')
+        if dist.get_rank() == 0:
+            fid = calculate_fid_from_inception_stats(mu, sigma, ref['mu'], ref['sigma'])
+            print(f'FID for images in {image_path}: {fid:g}')
+            fids.append(round(fid,2))
+            # Save to image_path as a txt file
+            with open(os.path.join(image_path, 'fid_multiplt.txt'), 'w') as f:
+                f.write(str(fid)+"\n")
+        torch.distributed.barrier()
+    print(fids)
 
 @main.command()
 @click.option('--data', 'dataset_path', help='Path to the dataset', metavar='PATH|ZIP', type=str, required=True)

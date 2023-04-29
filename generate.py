@@ -48,6 +48,8 @@ def get_args():
     parser.add_argument('--momentum', type=float, default=0.0, help='momentum for Euler/Heun solver')
     parser.add_argument('--phi', type=float, default=0.25)
     parser.add_argument('--shakedrop', action='store_true', help='Use shakedrop')
+    parser.add_argument('--discrete', action='store_true', help='Use discrete time point')
+    parser.add_argument('--total_N', type=int,default=16)
     parser.add_argument('--generator', default=1, type=int, help='generator')
     parser.add_argument('--generator_path', default="", type=str, help='generator path')
 
@@ -62,6 +64,8 @@ def main(arg):
     config = parse_config(arg.config_de)
     config['prior_shakedrop'] = arg.shakedrop
     config['phi'] = arg.phi
+    config['discrete_time'] = arg.discrete
+    config['total_N'] = arg.total_N
     if not os.path.exists(os.path.join(arg.dir, "samples")):
         os.makedirs(os.path.join(arg.dir, "samples"))
     if not os.path.exists(os.path.join(arg.dir, "zs")):
@@ -124,7 +128,7 @@ def main(arg):
             meta_generator.eval()
             generator_list.append(meta_generator)
         
-    rectified_flow = OnlineSlimFlow(device, flow_model, flow_model, generator_list, num_steps = arg.N,add_prior_z=False)
+    rectified_flow = OnlineSlimFlow(device, flow_model, flow_model, generator_list, num_steps = arg.N,add_prior_z=False,discrete=arg.discrete)
 
     rectified_flow.model.eval()
 

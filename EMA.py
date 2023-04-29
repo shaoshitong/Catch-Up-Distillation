@@ -100,6 +100,8 @@ class EMA(Optimizer):
 class EMAMODEL(object):
     def __init__(self,model):
         self.ema_model = deepcopy(model)
+        for parameter in self.ema_model.parameters():
+            parameter.requires_grad_(False)
         self.ema_model.eval()
 
     @torch.no_grad()

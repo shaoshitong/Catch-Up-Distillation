@@ -1,32 +1,9 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3 \
-      --dir ./runs/cifar10-onlineslim-predstep-2-rule-beta20/ --weight_prior 20 \
-      --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 \
-      --optimizer adam --batchsize 128 --iterations 500000 \
-      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 2 --adapt_cu rule
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-sam-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --sam
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-3-uniform-shakedrop0.75-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 3 --adapt_cu uniform --shakedrop
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-0.05-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop --sam
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-0.5-large-discrete-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_large_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3       --dir ./runs/cifar10-onlineslim-predstep-3-uniform-shakedrop0.75-discrete-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 150000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 3 --adapt_cu uniform --shakedrop --discrete
-
+python train_online_slim_reverse_img_ddp_update.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-beta20/ \
+    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 650000  \
+    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop --resume ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-beta20/training_state_latest.pth
 """
 import torch
 import numpy as np
@@ -115,166 +92,138 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
     samples_test = samples_test.to(device)
     # use tqdm if rank == 0
     tqdm_ = tqdm if rank == 0 else lambda x: x
-    criticion = nn.MSELoss().cuda(rank) if arg.loss_type != "lpips" else LPIPS().cuda(rank)
-    criticion_2 = nn.MSELoss().cuda(rank) if arg.loss_type == "mse" else LPIPS().cuda(rank)
-    for i in tqdm_(range(start_iter, iterations+1)):
-        optimizer.zero_grad()
-        # Learning rate warmup
-        if i < warmup_steps:
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = learning_rate * np.minimum(i / warmup_steps, 1)
-        try:
-            x, _ = next(train_iter)
-        except:
-            train_iter = iter(data_loader)
-            x, _ = next(train_iter)
-        x = x.to(device)
-        if independent:
-            z = torch.randn_like(x)
-            loss_prior = 0
-        else:
-            z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
-            loss_prior = get_kl(mu, logvar)
-        
-        #################################### Choose the loss function ####################################
-        if arg.pred_step==1:
-            pred_z_t,ema_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
-                    # Learn reverse model
-            if arg.adaptive_weight:
-                loss_fm = (i/iterations) * arg.l_weight[0] * criticion_2(pred_z_t , ema_z_t) + (1-i/iterations) * arg.l_weight[1] * criticion(pred_z_t , gt_z_t)
-            else:
-                loss_fm = 0.5 * arg.l_weight[0] * criticion_2(pred_z_t , ema_z_t) + 0.5 * arg.l_weight[1] * criticion(pred_z_t , gt_z_t)
-        elif arg.pred_step==2 or arg.pred_step==3:
-            loss_fm = torch.Tensor([0.]).to(device)
-            pred_z_t_list,ema_z_t_list,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
-            for pred_z_t,ema_z_t in zip(pred_z_t_list,ema_z_t_list):
-                if arg.adaptive_weight:
-                    loss_fm += (i/iterations) * arg.l_weight[0] * criticion_2(pred_z_t , ema_z_t)
+    criticion = nn.MSELoss().cuda(rank)
+    i = start_iter
+    for ii in range(1,arg.N+1): # 1-16
+        for jj in reversed(range(1,ii)): # 1-i
+            if rank==0:
+                print("Start Distillation for step {} to {}".format(jj,ii))
+            if ii==jj:
+                continue
+            for _ in range(1):
+                train_iter = iter(data_loader)
+                for _ in range(len(data_loader)):
+                    optimizer.zero_grad()
+                    try:
+                        x, _ = next(train_iter)
+                    except:
+                        continue
+                    x = x.to(device)
+                    if independent:
+                        z = torch.randn_like(x)
+                        loss_prior = 0
+                    else:
+                        z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
+                        loss_prior = get_kl(mu, logvar)
+                    z = z.to(device)
+                    now_t = torch.ones(x.shape[0],).to(x.device).float()*ii/arg.N
+                    pre_t = torch.ones(x.shape[0],).to(x.device).float()*jj/arg.N
+                    now_t = now_t.view(-1, 1, 1, 1)
+                    pre_t = pre_t.view(-1, 1, 1, 1)
+                    now_x = now_t*z+(1-now_t)*x
+                    pre_x = pre_t*z+(1-pre_t)*x
+                    now_pred = rectified_flow.model(now_x,now_t.view(now_t.shape[0],))
+                    pre_pred = rectified_flow.model(pre_x,pre_t.view(pre_t.shape[0],))
+                    loss = criticion(now_pred,pre_pred.detach())+criticion(z-x,pre_pred)+weight_prior*loss_prior
+                    loss = loss.mean()
+                    loss.backward()
+                    optimizer.step()
+                    rectified_flow.ema_model.ema_step(decay_rate=0.9999,model=rectified_flow.model)
+                    for j,ema_generator in enumerate(ema_generator_list):
+                        ema_generator.ema_step(decay_rate=0.9999,model=rectified_flow.generator_list[j])
+                    # Gather loss from all processes using torch.distributed.all_gather
+
+                    if isinstance(loss_prior,torch.Tensor):
+                        loss_prior = loss_prior.item()
+                    if i % 100 == 0 and rank == 0:
+                        print(f"Iteration {i}: loss {loss.item()}")
+                        writer.add_scalar("loss", loss.item(), i)
+                        writer.add_scalar("loss_prior", loss_prior, i)
+                        writer.add_scalar("lr", optimizer.param_groups[0]['lr'], i)
+                        # Log to .txt file
+                        with open(os.path.join(dir, 'log.txt'), 'a') as f:
+                            f.write(f"Iteration {i}: loss {loss:.8f}, loss_prior {loss_prior:.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
+
+                    if i % 5000 == 1 and rank == 0:
+                        rectified_flow.model.eval()
+                        if use_ema:
+                            rectified_flow.ema_model.ema_swap(rectified_flow.model)
+                        with torch.no_grad():
+                            if independent:
+                                z = torch.randn_like(x[:4])
+                            else:
+                                z, _, _ = forward_model(samples_test[:4], torch.ones((4), device=device))
+                            traj_reverse, traj_reverse_x0 = rectified_flow.sample_ode_generative(z1=z, N=sampling_steps)
+
+                            z = torch.randn_like(x)[:4]
+                            
+                            traj_uncond, traj_uncond_x0 = rectified_flow.sample_ode_generative(z1=z, N=sampling_steps)
+                            traj_uncond_N4, traj_uncond_x0_N4 = rectified_flow.sample_ode_generative(z1=z, N=4)
+                            traj_forward = rectified_flow.sample_ode(z0=samples_test, N=sampling_steps)
+
+                            uncond_straightness = straightness(traj_uncond)
+                            reverse_straightness = straightness(traj_reverse)
+
+                            print(f"Uncond straightness: {uncond_straightness.item()}, reverse straightness: {reverse_straightness.item()}")
+                            writer.add_scalar("uncond_straightness", uncond_straightness.item(), i)
+                            writer.add_scalar("reverse_straightness", reverse_straightness.item(), i)
+
+                            traj_reverse = torch.cat(traj_reverse, dim=0)
+                            traj_reverse_x0 = torch.cat(traj_reverse_x0, dim=0)
+                            traj_forward = torch.cat(traj_forward, dim=0)
+                            traj_uncond = torch.cat(traj_uncond, dim=0)
+                            traj_uncond_x0 = torch.cat(traj_uncond_x0, dim=0)
+                            traj_uncond_N4 = torch.cat(traj_uncond_N4, dim=0)
+                            traj_uncond_x0_N4 = torch.cat(traj_uncond_x0_N4, dim=0)
+
+                            save_image(traj_reverse*0.5 + 0.5, os.path.join(dir, f"traj_reverse_{i}.jpg"), nrow=4)
+                            save_image(traj_reverse_x0*0.5 + 0.5, os.path.join(dir, f"traj_reverse_x0_{i}.jpg"), nrow=4)
+                            save_image(traj_forward*0.5 + 0.5, os.path.join(dir, f"traj_forward_{i}.jpg"), nrow=4)
+                            save_image(traj_uncond*0.5 + 0.5, os.path.join(dir, f"traj_uncond_{i}.jpg"), nrow=4)
+                            save_image(traj_uncond_x0*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_{i}.jpg"), nrow=4)
+                            save_image(traj_uncond_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_N4_{i}.jpg"), nrow=4)
+                            save_image(traj_uncond_x0_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_N4_{i}.jpg"), nrow=4)
+                        if use_ema:
+                            rectified_flow.ema_model.ema_swap(rectified_flow.model)
+                        rectified_flow.model.train()
+                    
+                    if i % 5000 == 0 and rank == 0 and i > 0:
+                        # Save the latest training state
+                        d = {}
+                        d['optimizer_state_dict'] = optimizer.state_dict()
+                        d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
+                        d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
+                        if forward_model is not None:
+                            d['forward_model_state_dict'] = forward_model.module.state_dict()
+                        d['iter'] = i
+                        # save
+                        torch.save(d, os.path.join(dir, f"training_state_latest_2.pth"))  
+                    i+=1
+            if rank == 0:
+                if use_ema:
+                    for j,ema_generator in enumerate(ema_generator_list):
+                        ema_generator.ema_swap(rectified_flow.generator_list[j])
+                    rectified_flow.ema_model.ema_swap(rectified_flow.model)
+                    torch.save(rectified_flow.model.module.state_dict(), os.path.join(dir, f"flow_model_update_{ii}_ema.pth"))
+                    if forward_model is not None:
+                        torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_update_{ii}_ema.pth"))
+                    rectified_flow.ema_model.ema_swap(rectified_flow.model)
+                    for j,ema_generator in enumerate(ema_generator_list):
+                        ema_generator.ema_swap(rectified_flow.generator_list[j])
                 else:
-                    loss_fm += 0.5 * arg.l_weight[0] * criticion_2(pred_z_t , ema_z_t)
-            if arg.adaptive_weight:
-                loss_fm+= (1-i/iterations) * arg.l_weight[1] * criticion(pred_z_t_list[0] , gt_z_t)
-            else:
-                loss_fm+= 0.5 * arg.l_weight[1] * criticion(pred_z_t_list[0] , gt_z_t)
-        else:
-            raise NotImplementedError
-        ################################### Sharpness Aware Minimization #################################
-        if arg.sam:
-            loss_sam = rectified_flow.L_sam
-        else:
-            loss_sam = torch.Tensor([0.]).to(device)[0]
-        loss_fm+=loss_sam
-        #################################### Choose the loss function ####################################
-
-        loss_fm = loss_fm.mean()
-
-        loss = loss_fm + weight_prior * loss_prior
-        loss.backward()
-        optimizer.step()
-        rectified_flow.ema_model.ema_step(decay_rate=0.9999,model=rectified_flow.model)
-        for j,ema_generator in enumerate(ema_generator_list):
-            ema_generator.ema_step(decay_rate=0.9999,model=rectified_flow.generator_list[j])
-
-        
-        # Gather loss from all processes using torch.distributed.all_gather
-
-        if isinstance(loss_prior,torch.Tensor):
-            loss_prior = loss_prior.item()
-        if i % 100 == 0 and rank == 0:
-            print(f"Iteration {i}: loss {loss.item()}, loss_fm {loss_fm.item()}, loss_prior {loss_prior:.8f}, loss_sam {loss_sam.item():.8f}")
-            writer.add_scalar("loss", loss.item(), i)
-            writer.add_scalar("loss_fm", loss_fm.item(), i)
-            writer.add_scalar("loss_prior", loss_prior, i)
-            writer.add_scalar("loss_sam", loss_sam.item(), i)
-            writer.add_scalar("lr", optimizer.param_groups[0]['lr'], i)
-            # Log to .txt file
-            with open(os.path.join(dir, 'log.txt'), 'a') as f:
-                f.write(f"Iteration {i}: loss {loss:.8f}, loss_fm {loss_fm:.8f}, loss_prior {loss_prior:.8f}, loss_sam {loss_sam.item():.8f}, lr {optimizer.param_groups[0]['lr']:.4f} \n")
-
-        if i % 5000 == 1 and rank == 0:
-            rectified_flow.model.eval()
-            if use_ema:
-                rectified_flow.ema_model.ema_swap(rectified_flow.model)
-            with torch.no_grad():
-                if independent:
-                    z = torch.randn_like(x[:4])
-                else:
-                    z, _, _ = forward_model(samples_test[:4], torch.ones((4), device=device))
-                traj_reverse, traj_reverse_x0 = rectified_flow.sample_ode_generative(z1=z, N=sampling_steps)
-
-                z = torch.randn_like(x)[:4]
-                
-                traj_uncond, traj_uncond_x0 = rectified_flow.sample_ode_generative(z1=z, N=sampling_steps)
-                traj_uncond_N4, traj_uncond_x0_N4 = rectified_flow.sample_ode_generative(z1=z, N=4)
-                traj_forward = rectified_flow.sample_ode(z0=samples_test, N=sampling_steps)
-
-                uncond_straightness = straightness(traj_uncond)
-                reverse_straightness = straightness(traj_reverse)
-
-                print(f"Uncond straightness: {uncond_straightness.item()}, reverse straightness: {reverse_straightness.item()}")
-                writer.add_scalar("uncond_straightness", uncond_straightness.item(), i)
-                writer.add_scalar("reverse_straightness", reverse_straightness.item(), i)
-
-                traj_reverse = torch.cat(traj_reverse, dim=0)
-                traj_reverse_x0 = torch.cat(traj_reverse_x0, dim=0)
-                traj_forward = torch.cat(traj_forward, dim=0)
-                traj_uncond = torch.cat(traj_uncond, dim=0)
-                traj_uncond_x0 = torch.cat(traj_uncond_x0, dim=0)
-                traj_uncond_N4 = torch.cat(traj_uncond_N4, dim=0)
-                traj_uncond_x0_N4 = torch.cat(traj_uncond_x0_N4, dim=0)
-
-                save_image(traj_reverse*0.5 + 0.5, os.path.join(dir, f"traj_reverse_{i}.jpg"), nrow=4)
-                save_image(traj_reverse_x0*0.5 + 0.5, os.path.join(dir, f"traj_reverse_x0_{i}.jpg"), nrow=4)
-                save_image(traj_forward*0.5 + 0.5, os.path.join(dir, f"traj_forward_{i}.jpg"), nrow=4)
-                save_image(traj_uncond*0.5 + 0.5, os.path.join(dir, f"traj_uncond_{i}.jpg"), nrow=4)
-                save_image(traj_uncond_x0*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_{i}.jpg"), nrow=4)
-                save_image(traj_uncond_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_N4_{i}.jpg"), nrow=4)
-                save_image(traj_uncond_x0_N4*0.5 + 0.5, os.path.join(dir, f"traj_uncond_x0_N4_{i}.jpg"), nrow=4)
-            if use_ema:
-                rectified_flow.ema_model.ema_swap(rectified_flow.model)
-            rectified_flow.model.train()
-        
-
-        if i % 50000 == 0 and rank == 0:
-            if use_ema:
-                for j,ema_generator in enumerate(ema_generator_list):
-                    ema_generator.ema_swap(rectified_flow.generator_list[j])
-                rectified_flow.ema_model.ema_swap(rectified_flow.model)
-                torch.save(rectified_flow.model.module.state_dict(), os.path.join(dir, f"flow_model_{i}_ema.pth"))
-                if rectified_flow.generator_list is not None:
-                    torch.save([generator.state_dict() for generator in rectified_flow.generator_list], os.path.join(dir, f"generator_list_{i}_ema.pth"))
+                    torch.save(rectified_flow.model.state_dict(), os.path.join(dir, f"flow_model_update_{ii}_ema.pth"))
+                    if forward_model is not None:
+                        torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_update_{ii}_ema.pth"))
+                # Save training state
+                d = {}
+                d['optimizer_state_dict'] = optimizer.state_dict()
+                d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
+                d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
                 if forward_model is not None:
-                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_{i}_ema.pth"))
-                rectified_flow.ema_model.ema_swap(rectified_flow.model)
-                for j,ema_generator in enumerate(ema_generator_list):
-                    ema_generator.ema_swap(rectified_flow.generator_list[j])
-            else:
-                torch.save(rectified_flow.model.state_dict(), os.path.join(dir, f"flow_model_{i}.pth"))
-                if rectified_flow.generator_list is not None:
-                    torch.save([generator.state_dict() for generator in rectified_flow.generator_list], os.path.join(dir, f"generator_list_{i}.pth"))
-                if forward_model is not None:
-                    torch.save(forward_model.module.state_dict(), os.path.join(dir, f"forward_model_{i}.pth"))
-            # Save training state
-            d = {}
-            d['optimizer_state_dict'] = optimizer.state_dict()
-            d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
-            d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
-            if forward_model is not None:
-                d['forward_model_state_dict'] = forward_model.module.state_dict()
-            d['iter'] = i
-            # save
-            torch.save(d, os.path.join(dir, f"training_state_{i}.pth"))  
-        if i % 5000 == 0 and rank == 0 and i > 0:
-            # Save the latest training state
-            d = {}
-            d['optimizer_state_dict'] = optimizer.state_dict()
-            d['model_state_dict'] = [rectified_flow.model.module.state_dict(),rectified_flow.ema_model.ema_model.module.state_dict()]
-            d['generator_list'] = [generator.state_dict() for generator in rectified_flow.generator_list] if rectified_flow.generator_list is not None else []
-            if forward_model is not None:
-                d['forward_model_state_dict'] = forward_model.module.state_dict()
-            d['iter'] = i
-            # save
-            torch.save(d, os.path.join(dir, f"training_state_latest.pth"))  
+                    d['forward_model_state_dict'] = forward_model.module.state_dict()
+                d['iter'] = i
+                # save
+                torch.save(d, os.path.join(dir, f"training_state_{i}.pth"))  
 
     return rectified_flow
 
@@ -321,11 +270,13 @@ def get_loader(dataset, batchsize, world_size, rank):
                                     download=True)
     else:
         raise NotImplementedError
+
+
     data_loader = torch.utils.data.DataLoader(dataset=dataset_train,
                                             batch_size=batchsize,
                                             drop_last=True,
                                             num_workers=4,
-                                            sampler = DistributedSampler(dataset_train, num_replicas=world_size, rank=rank))
+                                            sampler = DistributedSampler(dataset_train))
     print("BatchSize is:",batchsize)
     data_loader_test = torch.utils.data.DataLoader(dataset=dataset_test,
                                                 batch_size=batchsize,
@@ -381,8 +332,8 @@ def main(rank: int, world_size: int, arg):
         start_iter = training_state['iter']
 
         flow_model = model_class(**config_de)
-        now_iteration = arg.iterations
-        flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][0]))
+        iation = arg.iterations
+        flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][1]))
         if forward_model is not None:
             forward_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['forward_model_state_dict']))
         print("Successfully Load Checkpoint!")
@@ -392,7 +343,7 @@ def main(rank: int, world_size: int, arg):
         if arg.pretrain is not None:
             flow_model.load_state_dict(convert_ddp_state_dict_to_single(pretrain_state))
             print("Successfully Load Pretrained Flow Model!")
-        now_iteration = arg.iterations
+        iation = arg.iterations
         if forward_model is not None:
             if arg.preforward is not None:
                 preforward_state = torch.load(arg.preforward, map_location = 'cpu')
@@ -474,11 +425,11 @@ def main(rank: int, world_size: int, arg):
     rectified_flow = OnlineSlimFlow(device, flow_model, ema_model, generator_list,num_steps = arg.N,add_prior_z=arg.add_prior_z,adapt_cu=arg.adapt_cu,sam=arg.sam,discrete=arg.discrete_time)
     if rank==0:
         print(f"Start training, with len(generator_list): {len(generator_list) if generator_list is not None else 0}, with adaptive_weight: {arg.adaptive_weight}")
-        print(f"Iteration begin: {start_iter}, Iteration end: {now_iteration}, Iteration total: {now_iteration - start_iter}")
+        print(f"Iteration begin: {start_iter}, Iteration end: {iation}, Iteration total: {iation - start_iter}")
         print(f"Using Shakedrop: {arg.shakedrop}, Using EMA: {arg.use_ema}, Using Independent: {arg.independent}")
         
     train_rectified_flow(rank = rank, rectified_flow = rectified_flow, forward_model = forward_model, optimizer = optimizer,
-                        data_loader = data_loader, iterations = now_iteration, device = device, start_iter = start_iter,
+                        data_loader = data_loader, iterations = iation, device = device, start_iter = start_iter,
                         warmup_steps = arg.warmup_steps, dir = arg.dir, learning_rate = arg.learning_rate, independent = arg.independent,
                         samples_test = samples_test, use_ema = arg.use_ema, ema_after_steps = arg.ema_after_steps, sampling_steps = arg.N, world_size=world_size,
                         weight_prior=arg.weight_prior,ema_generator_list=ema_generator_list,arg = arg)

@@ -269,4 +269,5 @@ def merge_images(folder_path, output_path, n, m):
 #     plt.savefig("./test.png")
 
 if __name__=="__main__":
-    merge_images("./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-t-beta20/test_16/trajs_15/", "./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-t-beta20/test_16/samples.png",15,15)
+    for i in range(7):
+        merge_images(f"./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-discrete-beta20/test_8/trajs_{i}/", f"./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-discrete-beta20/test_8/sample_trajs_{i}.png",15,15)

@@ -88,7 +88,8 @@ class Dataset(torch.utils.data.Dataset):
         return len(self._raw_idx)
 
     def __getitem__(self, idx):
-        raw_idx = self._raw_idx[idx]
+        idx = idx%self.__len__()
+        raw_idx = self._raw_idx[idx%self.__len__()]
         image = self._cached_images.get(raw_idx, None)
         if image is None:
             image = self._load_raw_image(raw_idx)
@@ -98,10 +99,10 @@ class Dataset(torch.utils.data.Dataset):
 
         assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
-        if self._xflip[idx]:
+        if self._xflip[idx%self.__len__()]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
-        return image.copy(), self.get_label(idx)
+        return image.copy(), self.get_label(idx%self.__len__())
 
     def get_label(self, idx):
         label = self._get_raw_labels()[self._raw_idx[idx]]
