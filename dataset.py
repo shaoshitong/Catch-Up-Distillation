@@ -53,3 +53,32 @@ class DatasetWithLatent(Dataset):
         latent = np.load(latent_name)
         latent = torch.tensor(latent, dtype=torch.float32)
         return img, latent
+
+class DatasetWithTraj(Dataset):
+    def __init__(self, traj_dir_list, input_nc):
+        super().__init__()
+        self.input_nc = input_nc
+        self.traj_dir_list = traj_dir_list
+        self.transforms = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) if input_nc == 3 else transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+        self.set_traj(0)
+        for traj_dir in traj_dir_list:
+            assert os.path.exists(traj_dir), f"{traj_dir} does not exist"
+
+    def set_traj(self,i):
+        self.trag_idx = i
+        img_list = glob.glob(os.path.join(self.traj_dir_list[self.trag_idx], '*.png')) + glob.glob(os.path.join(self.traj_dir_list[self.trag_idx], '*.jpg'))
+        img_list.sort()
+        self.img_list = img_list
+
+    def __len__(self):
+        return len(self.img_list)
+    def __getitem__(self, idx):
+        img = Image.open(self.img_list[idx])
+        if self.input_nc == 1:
+            img = img.convert('L')
+        img = np.array(img)
+        img = self.transforms(img)
+        return img
