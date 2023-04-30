@@ -65,6 +65,8 @@ def get_args():
     parser.add_argument('--optimizer', type=str, default = 'adamw', help='adam / adamw')
     parser.add_argument('--warmup_steps', type=int, default = 0, help='Learning rate warmup')
     parser.add_argument('--weight_prior', type=float, default = 10, help='Prior loss weight')
+    parser.add_argument('--discrete',  action='store_true', help='use discrete or not')
+    parser.add_argument('--ema_rate', type=float, default = 0.999945, help='The rate of EMA model')
     parser.add_argument('--loss_type', type=str, default = "mse", help='The loss type for the flow model')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
@@ -109,7 +111,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         loss = loss_fm + weight_prior * loss_prior
         loss.backward()
         optimizer.step()
-        rectified_flow.ema_model.ema_step(decay_rate=0.99999,model=rectified_flow.model)
+        rectified_flow.ema_model.ema_step(decay_rate=arg.ema_rate,model=rectified_flow.model)
 
         
         # Gather loss from all processes using torch.distributed.all_gather
@@ -357,7 +359,7 @@ def main(rank: int, world_size: int, arg):
         ema_model = EMAMODEL(model=flow_model)
         if arg.resume is not None:
             ema_model.ema_model.module.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][0]))
-    rectified_flow = ConsistencyFlow(device, flow_model, ema_model, num_steps = arg.N)
+    rectified_flow = ConsistencyFlow(device, flow_model, ema_model, num_steps = arg.N,discrete=arg.discrete)
     train_rectified_flow(rank = rank, rectified_flow = rectified_flow, forward_model = forward_model, optimizer = optimizer,
                         data_loader = data_loader, iterations = now_iteration, device = device, start_iter = start_iter,
                         warmup_steps = arg.warmup_steps, dir = arg.dir, learning_rate = arg.learning_rate, independent = arg.independent,

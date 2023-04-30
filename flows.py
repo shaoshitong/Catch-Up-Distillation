@@ -347,18 +347,22 @@ class ResidualFlow(RectifiedFlow):
     return z1
 
 class ConsistencyFlow(RectifiedFlow):
-  def __init__(self, device,model, ema_model,num_steps=1000,TN=16):
+  def __init__(self, device,model, ema_model,num_steps=1000,TN=16,discrete=False):
     self.ema_model = ema_model
     import copy
     self.pre_train_model = copy.deepcopy(ema_model)
+    self.discrete = discrete
     self.model = model
     self.N = num_steps
     self.TN = TN
     self.device = device
 
-  def get_train_tuple(self, z0=None, z1=None, t = None,eps=1e-2):
+  def get_train_tuple(self, z0=None, z1=None, t = None,eps=1e-3):
     if t is None:
-      t = torch.rand((z0.shape[0],)).to(z1.device).float()
+      if self.discrete:
+        t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+      else:
+        t = torch.rand((z0.shape[0],)).to(z1.device).float()
     if len(z1.shape) == 2:
       pre_z_t =  t * z1 + (1.-t) * z0
     elif len(z1.shape) == 4:
@@ -370,13 +374,14 @@ class ConsistencyFlow(RectifiedFlow):
     
     with torch.no_grad():
       now_z_t = pre_z_t - (1/self.TN)*self.pre_train_model(pre_z_t,t)
-      now_t = torch.clamp(t - (1/self.TN),0,1)
+      now_t = torch.clamp(t - (1/self.TN),1/self.TN,1)
     
     pred_z_t = self.model(pre_z_t,t)
     with torch.no_grad():
       gt_z_t = self.ema_model(now_z_t,now_t)
     return pred_z_t, gt_z_t
   
+
 
 class OnlineSlimFlow(RectifiedFlow):
   def __init__(self, device, model, ema_model, generator_list=None, num_steps=1000,TN=16,adapt_cu="origin",add_prior_z=False,sam=False,discrete=False):
