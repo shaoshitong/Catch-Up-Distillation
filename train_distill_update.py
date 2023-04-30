@@ -1,9 +1,8 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
-python train_online_slim_reverse_img_ddp_update.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 650000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop --resume ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-beta20/training_state_latest.pth
+ python train_distill_update.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-predstep-1-distill-beta20/ --traj_dir ./runs/cifar10-predstep-1-distill-beta20/test_16/     --learning_rate 2e-4 --optimizer adam --batchsize 128 --iterations 100000 --flow_ckpt ./runs/cifar10-predstep-1-distill-beta20/flow_model_500000_ema.pth --forward_ckpt ./runs/cifar10-predstep-1-distill-beta20/forward_model_500000_ema.pth      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --pred_step 1
+
 """
 import torch
 import numpy as np
@@ -48,6 +47,8 @@ def ddp_setup(rank, world_size,arg):
 def get_args():
     parser = argparse.ArgumentParser(description='Configs')
     parser.add_argument('--gpu', type=str, help='gpu num')
+    parser.add_argument('--res', type=int,default=32, help='resolution')
+    parser.add_argument('--input_nc', type=int,default=3, help='input channel')
     parser.add_argument('--dir', type=str, help='Saving directory name')
     parser.add_argument('--traj_dir', type=str, help='Trajectory directory name')
     parser.add_argument('--weight_cur', type=float, default = 0, help='Curvature regularization weight')
@@ -70,23 +71,22 @@ def get_args():
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
 
     arg = parser.parse_args()
-
-    assert arg.dataset in ['cifar10', 'mnist', 'celebahq']
-    arg.use_ema = not arg.no_ema
     return arg
 
 
-def distill(flow_model, forward_model, train_loader, iterations, optimizer, data_shape,device,ema_flow_model=None):
+def distill(flow_model, forward_model, train_loader, iterations, optimizer, data_shape,device,arg,ema_flow_model=None):
     z_fixed = torch.randn(data_shape, device=device)
+    use_list = [8,11,14]
     for _num in range(3):
-        train_loader.dataset.set_traj((_num+1)*5)
+        print('Trajectory: ',train_loader.dataset.traj_dir_list[use_list[_num]])
+        train_loader.dataset.set_traj(use_list[_num])
         for i in tqdm(range(iterations+1)):
             optimizer.zero_grad()
             try:
-                x = train_iter.next()
+                x = next(train_iter)
             except:
                 train_iter = iter(train_loader)
-                x = train_iter.next()
+                x = next(train_iter)
             x = x.to(device)
             z,_,_ = forward_model(x, torch.ones((x.shape[0]), device=device))
             # Learn student model
@@ -127,7 +127,12 @@ def main(rank: int, world_size: int, arg):
         assert arg.config_en is not None
         config_en = parse_config(arg.config_en)
     config_de = parse_config(arg.config_de)
-    train_dataset = DatasetWithTraj(arg.im_dir, arg.z_dir, input_nc = input_nc)
+    traj_list = []
+    for i in range(16):
+      _path = os.path.join(arg.traj_dir,f"trajs_{i}")
+      traj_list.append(_path)
+    
+    train_dataset = DatasetWithTraj(traj_list,input_nc = input_nc)
     data_loader = torch.utils.data.DataLoader(train_dataset, batch_size=arg.batchsize, num_workers=4,sampler=torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank))
     data_shape = (arg.batchsize, input_nc, res, res)
     samples_test =  torch.randn((4, input_nc, res, res), device=device)
@@ -157,10 +162,10 @@ def main(rank: int, world_size: int, arg):
     elif config_de['unet_type'] == 'dwtunet':
         model_class = DWTUNet
 
-    assert arg.flow_model is not None
-    assert arg.forward_model is not None
-    flow_model_ckpt = torch.load(arg.flow_model, map_location = 'cpu')
-    forward_model_ckpt = torch.load(arg.forward_model, map_location = 'cpu')
+    assert arg.flow_ckpt is not None
+    assert arg.forward_ckpt is not None
+    flow_model_ckpt = torch.load(arg.flow_ckpt, map_location = 'cpu')
+    forward_model_ckpt = torch.load(arg.forward_ckpt, map_location = 'cpu')
     flow_model = model_class(**config_de)
     flow_model.load_state_dict(convert_ddp_state_dict_to_single(flow_model_ckpt))
     forward_model.load_state_dict(convert_ddp_state_dict_to_single(forward_model_ckpt))
@@ -215,7 +220,7 @@ def main(rank: int, world_size: int, arg):
     if rank==0:
         print(f"Start training")
         
-    distill(flow_model, forward_model, data_loader, arg.iterations, optimizer, data_shape,device,ema_flow_model=ema_flow_model)
+    distill(flow_model, forward_model, data_loader, arg.iterations, optimizer, data_shape,device,arg,ema_flow_model=ema_flow_model)
     destroy_process_group()
 
 if __name__ == "__main__":
