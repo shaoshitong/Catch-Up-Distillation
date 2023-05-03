@@ -380,6 +380,57 @@ class ConsistencyFlow(RectifiedFlow):
       gt_z_t = self.ema_model(now_z_t,now_t)
     return pred_z_t, gt_z_t
   
+class ProgDistFlow(RectifiedFlow):
+  def __init__(self, device,student_model, teacher_model,TN=16):
+    self.student_model = student_model
+    self.teacher_model = teacher_model
+    self.TN = TN
+    self.device = device
+  def get_train_tuple(self, z0=None, z1=None, t = None,eps=1e-3):
+    if t is None:
+      t = torch.randint(2,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+    if len(z1.shape) == 2:
+      pre_z_t =  t * z1 + (1.-t) * z0
+    elif len(z1.shape) == 4:
+      t = t.view(-1, 1, 1, 1)
+      pre_z_t =  t * z1 + (1.-t) * z0
+      t = t.view(-1)
+    else:
+      raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
+    student_output = self.student_model(pre_z_t,t)
+    with torch.no_grad():
+      t_h = torch.clamp(t - (1/self.TN),1/self.TN,1)
+      pre_z_t_h = pre_z_t - (1/self.TN)*self.teacher_model(pre_z_t,t)
+      pre_z_t_2h = pre_z_t_h - (1/self.TN)*self.teacher_model(pre_z_t_h,t_h)
+      teacher_output = (pre_z_t - pre_z_t_2h)/(2/self.TN)
+    return student_output,teacher_output
+
+
+
+
+  def get_train_tuple(self, z0=None, z1=None, t = None,eps=1e-3):
+    if t is None:
+      if self.discrete:
+        t = torch.randint(1,self.TN+1,(z0.shape[0],)).to(z1.device).float()/self.TN
+      else:
+        t = torch.rand((z0.shape[0],)).to(z1.device).float()
+    if len(z1.shape) == 2:
+      pre_z_t =  t * z1 + (1.-t) * z0
+    elif len(z1.shape) == 4:
+      t = t.view(-1, 1, 1, 1)
+      pre_z_t =  t * z1 + (1.-t) * z0
+      t = t.view(-1)
+    else:
+      raise NotImplementedError(f"get_train_tuple not implemented for {self.__class__.__name__}.")
+    
+    with torch.no_grad():
+      now_z_t = pre_z_t - (1/self.TN)*self.pre_train_model(pre_z_t,t)
+      now_t = torch.clamp(t - (1/self.TN),1/self.TN,1)
+    
+    pred_z_t = self.model(pre_z_t,t)
+    with torch.no_grad():
+      gt_z_t = self.ema_model(now_z_t,now_t)
+    return pred_z_t, gt_z_t
 
 
 class OnlineSlimFlow(RectifiedFlow):

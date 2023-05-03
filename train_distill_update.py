@@ -1,7 +1,9 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
- python train_distill_update.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-predstep-1-distill-beta20/ --traj_dir ./runs/cifar10-predstep-1-distill-beta20/test_16/     --learning_rate 2e-4 --optimizer adam --batchsize 128 --iterations 100000 --flow_ckpt ./runs/cifar10-predstep-1-distill-beta20/flow_model_500000_ema.pth --forward_ckpt ./runs/cifar10-predstep-1-distill-beta20/forward_model_500000_ema.pth      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --pred_step 1
+ python train_distill_update.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-predstep-1-distill-beta20/ --latent_dir ./runs/cifar10-predstep-1-distill-beta20/test_16/zs/ \
+    --traj_dir ./runs/cifar10-predstep-1-distill-beta20/test_16/     --learning_rate 2e-4 --optimizer adam --batchsize 128 \
+        --iterations 100000 --flow_ckpt ./runs/cifar10-predstep-1-distill-beta20/flow_model_500000_ema.pth    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --pred_step 1
 
 """
 import torch
@@ -51,14 +53,15 @@ def get_args():
     parser.add_argument('--input_nc', type=int,default=3, help='input channel')
     parser.add_argument('--dir', type=str, help='Saving directory name')
     parser.add_argument('--traj_dir', type=str, help='Trajectory directory name')
+    parser.add_argument('--latent_dir', type=str, help='Latent directory name')
     parser.add_argument('--weight_cur', type=float, default = 0, help='Curvature regularization weight')
     parser.add_argument('--iterations', type=int, default = 100000, help='Number of iterations')
     parser.add_argument('--batchsize', type=int, default = 256, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default = 8e-4, help='Learning rate')
     parser.add_argument('--independent', action = 'store_true',  help='Independent assumption, q(x,z) = p(x)p(z)')
+    parser.add_argument('--resume', default=None,type=str, help='Resume training from a given checkpoint')
     parser.add_argument('--flow_ckpt', type=str, default = None, help='Training state path')
     parser.add_argument('--forward_ckpt', type=str, default = None, help='Training state path')
-    parser.add_argument('--pretrain', type=str, default = None, help='Pretrain model state path')
     parser.add_argument('--preforward', type=str, default = None, help='Pretrain forward state path')
     parser.add_argument('--pred_step', type=int, default = 1, help='Predict step')
     parser.add_argument('--N', type=int, default = 16, help='Number of sampling steps')
@@ -74,21 +77,32 @@ def get_args():
     return arg
 
 
-def distill(flow_model, forward_model, train_loader, iterations, optimizer, data_shape,device,arg,ema_flow_model=None):
+def distill(rank,flow_model, train_loader, iterations, optimizer, data_shape,device,arg,state_dict=None,ema_flow_model=None):
     z_fixed = torch.randn(data_shape, device=device)
     use_list = [8,11,14]
-    for _num in range(3):
+    begin_num = 0
+    begin_iter = 0
+    if state_dict is not None:
+        flow_model.load_state_dict(state_dict['flow_model'])
+        if ema_flow_model is not None:
+            ema_flow_model.load_state_dict(state_dict['ema_flow_model'])
+        optimizer.load_state_dict(state_dict['optimizer'])
+        begin_num = state_dict['num']
+        begin_iter = state_dict['iter']
+    for _num in range(begin_num,3):
         print('Trajectory: ',train_loader.dataset.traj_dir_list[use_list[_num]])
         train_loader.dataset.set_traj(use_list[_num])
-        for i in tqdm(range(iterations+1)):
+        if _num!=begin_num:
+            begin_iter = 0
+        for i in tqdm(range(begin_iter,iterations+1)):
             optimizer.zero_grad()
             try:
-                x = next(train_iter)
+                x,z = next(train_iter)
             except:
                 train_iter = iter(train_loader)
-                x = next(train_iter)
+                x,z = next(train_iter)
             x = x.to(device)
-            z,_,_ = forward_model(x, torch.ones((x.shape[0]), device=device))
+            z = z.to(device)
             # Learn student model
             pred_v = flow_model(z, torch.ones(z.shape[0], device=device))
             pred = z - pred_v
@@ -109,6 +123,14 @@ def distill(flow_model, forward_model, train_loader, iterations, optimizer, data
                     pred = z_fixed - pred_v
                     save_image(pred * 0.5 + 0.5, os.path.join(arg.dir, f"pred_{i}.jpg"))
                 flow_model.train()
+                if rank == 0 and i%10000==0:
+                    train_state = {}
+                    train_state['flow_model'] = flow_model.module.state_dict()
+                    train_state['ema_flow_model'] = ema_flow_model.ema_model.module.state_dict()
+                    train_state['iter'] = i
+                    train_state['num'] = _num
+                    train_state['optimizer'] = optimizer.state_dict()
+                    torch.save(train_state, os.path.join(arg.dir, f"train_state_lastet.pth"))
         torch.save(flow_model.state_dict(), os.path.join(arg.dir, f"flow_model_distilled_{_num}.pth"))
 
 
@@ -132,28 +154,11 @@ def main(rank: int, world_size: int, arg):
       _path = os.path.join(arg.traj_dir,f"trajs_{i}")
       traj_list.append(_path)
     
-    train_dataset = DatasetWithTraj(traj_list,input_nc = input_nc)
+    train_dataset = DatasetWithTraj(traj_list,latent_dir=arg.latent_dir,input_nc = input_nc)
     data_loader = torch.utils.data.DataLoader(train_dataset, batch_size=arg.batchsize, num_workers=4,sampler=torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank))
     data_shape = (arg.batchsize, input_nc, res, res)
     samples_test =  torch.randn((4, input_nc, res, res), device=device)
-    
-    if not arg.independent:
-        if config_en['unet_type'] == 'adm':
-            model_class = UNetModel
-        elif config_en['unet_type'] == 'songunet':
-            model_class = SongUNet
-        elif config_en['unet_type'] == 'dwtunet':
-            model_class = DWTUNet
 
-        # Pass the arguments in the config file to the model
-        encoder = model_class(**config_en)
-        forward_model = UNetEncoder(encoder = encoder, input_nc = input_nc)
-    else:
-        forward_model = None
-    # forward_model = torch.compile(forward_model,backend="inductor")
-
-    if arg.pretrain is not None:
-        pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
     config_de['total_N'] = arg.N
     if config_de['unet_type'] == 'adm':
         model_class = UNetModel
@@ -163,12 +168,9 @@ def main(rank: int, world_size: int, arg):
         model_class = DWTUNet
 
     assert arg.flow_ckpt is not None
-    assert arg.forward_ckpt is not None
     flow_model_ckpt = torch.load(arg.flow_ckpt, map_location = 'cpu')
-    forward_model_ckpt = torch.load(arg.forward_ckpt, map_location = 'cpu')
     flow_model = model_class(**config_de)
     flow_model.load_state_dict(convert_ddp_state_dict_to_single(flow_model_ckpt))
-    forward_model.load_state_dict(convert_ddp_state_dict_to_single(forward_model_ckpt))
     print("Successfully Load Checkpoint!")
 
     if rank == 0:
@@ -183,23 +185,14 @@ def main(rank: int, world_size: int, arg):
         config_dict['num_params'] = pytorch_total_params
         with open(os.path.join(arg.dir, 'config_flow_model.json'), 'w') as f:
             json.dump(config_dict, f, indent = 4)
-        
-        # Forward model parameters
-        if not arg.independent:
-            pytorch_total_params = sum(p.numel() for p in forward_model.parameters())
-            # Convert to M
-            pytorch_total_params = pytorch_total_params / 1000000
-            print(f"Total number of the forward parameters: {pytorch_total_params}M")
-            # Save the configuration of encoder to a json file
-            config_dict = forward_model.encoder.config if not isinstance(forward_model, DDP) else forward_model.module.encoder.config
-            config_dict['num_params'] = pytorch_total_params
-            with open(os.path.join(arg.dir, 'config_encoder.json'), 'w') as f:
-                json.dump(config_dict, f, indent = 4)
+    if arg.resume is not None:
+        state_dict = torch.load(arg.resume, map_location = 'cpu')
+    else:
+        state_dict = None
+
+
     ################################## FLOW MODEL AND FORWARD MODEL #########################################
-    if forward_model is not None:
-        forward_model = forward_model.to(device)
-        # forward_model = torch.compile(forward_model)
-        forward_model = DDP(forward_model, device_ids=[rank])
+
     flow_model = flow_model.to(device)
     # flow_model = torch.compile(flow_model)
     flow_model = DDP(flow_model, device_ids=[rank])
@@ -220,7 +213,7 @@ def main(rank: int, world_size: int, arg):
     if rank==0:
         print(f"Start training")
         
-    distill(flow_model, forward_model, data_loader, arg.iterations, optimizer, data_shape,device,arg,ema_flow_model=ema_flow_model)
+    distill(rank,flow_model, data_loader, arg.iterations, optimizer, data_shape,device,arg,state_dict=state_dict,ema_flow_model=ema_flow_model)
     destroy_process_group()
 
 if __name__ == "__main__":

@@ -162,7 +162,7 @@ def main(arg):
         x0_list = []
         straightness_list = []
         nfes = []
-        z_norm_list = []
+        z_list = []
         for ep in tqdm(range(epoch)):
             noise = torch.randn(arg.batchsize, arg.input_nc, arg.res, arg.res).to(device)
             save_image(noise, "debug1.jpg")
@@ -175,8 +175,7 @@ def main(arg):
             else:
                 z = noise
             # Compute the norm of z
-            z_norm = torch.sum(z ** 2, dim = [1,2,3]).sqrt()
-            z_norm_list.append(z_norm)
+            z_list.append(z)
             save_image(z, "debug2.jpg")
             if arg.solver in ['euler', 'heun']:
                 traj_uncond, traj_uncond_x0 = rectified_flow.sample_ode_generative(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver,momentum=arg.momentum,generator_id=arg.generator)
