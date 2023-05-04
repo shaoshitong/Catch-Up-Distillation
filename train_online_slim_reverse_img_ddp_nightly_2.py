@@ -1,32 +1,12 @@
 # From https://colab.research.google.com/drive/1LouqFBIC7pnubCOl5fhnFd33-oVJao2J?usp=sharing#scrollTo=yn1KM6WQ_7Em
 
 """
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3 \
-      --dir ./runs/cifar10-onlineslim-predstep-2-rule-beta20/ --weight_prior 20 \
-      --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000 \
-      --optimizer adam --batchsize 128 --iterations 500000 \
-      --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 2 --adapt_cu rule
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-sam-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --sam
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-3-uniform-shakedrop0.75-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 3 --adapt_cu uniform --shakedrop
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 0,1,2,3       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-0.05-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop --sam
-
-python train_online_slim_reverse_img_ddp_nightly.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-sam-0.5-large-discrete-beta20/ \
-    --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
-    --config_en configs/cifar10_en.json --config_de configs/cifar10_large_de.json --loss_type mse --pred_step 1 --adapt_cu uniform --shakedrop
-
 python train_online_slim_reverse_img_ddp_nightly_2.py  --N 16 --gpu 4,5,6,7       --dir ./runs/cifar10-onlineslim-predstep-2-uniform-shakedrop0.75-beta20/ \
     --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
     --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 2 --adapt_cu uniform --shakedrop
-
+python train_online_slim_reverse_img_ddp_nightly_2.py  --N 16 --gpu 0,1,2,3       --dir ./runs/cifar10-onlineslim-predstep-3-uniform-shakedrop0.75-beta20/ \
+            --weight_prior 20 --learning_rate 2e-4 --dataset cifar10 --warmup_steps 5000  --optimizer adam --batchsize 128 --iterations 500000  \
+                --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json --loss_type mse --pred_step 3 --adapt_cu uniform --shakedrop
 """
 import torch
 import numpy as np
@@ -135,7 +115,7 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
         else:
             z, mu, logvar = forward_model(x, torch.ones((x.shape[0]), device=device))
             loss_prior = get_kl(mu, logvar)
-        
+        predstep_loss_list = []
         #################################### Choose the loss function ####################################
         if arg.pred_step==1:
             pred_z_t,ema_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
@@ -149,7 +129,6 @@ def train_rectified_flow(rank, rectified_flow, forward_model, optimizer, data_lo
             pred_z_t_list,ema_z_t_list,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z,pred_step=arg.pred_step)
             predstep_2_weight=[1,1/8]
             predstep_3_weight=[1,1/16,1/81]
-            predstep_loss_list = []
             _iii = 0
             for pred_z_t,ema_z_t in zip(pred_z_t_list,ema_z_t_list):
                 if arg.pred_step == 2:
