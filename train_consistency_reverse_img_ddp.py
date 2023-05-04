@@ -4,6 +4,10 @@
 python train_consistency_reverse_img_ddp.py --N 16 --gpu 0,1,2,3 --dir ./runs/cifar10-consistency-mse-16-beta20/ \
 --weight_prior 20 --learning_rate 1e-2 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 128 --iterations 600000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json \
  --pretrain ./runs/cifar10-beta20/flow_model_500000_ema.pth --preforward ./runs/cifar10-beta20/forward_model_500000_ema.pth --independent
+
+python train_consistency_reverse_img_ddp.py --N 16 --gpu 0,1,2,3 --dir ./runs/mnist-consistency-beta20/ \
+--weight_prior 20 --learning_rate 3e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 256 --iterations 50000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json \
+ --pretrain ./runs/mnist-beta20/flow_model_50000_ema.pth --preforward ./runs/mnist-beta20/forward_model_50000_ema.pth --independent --ema_rate 0.999945
 """
 import torch
 import numpy as np
@@ -288,14 +292,13 @@ def main(rank: int, world_size: int, arg):
 
     assert arg.pretrain is not None, "Please specify the pretrain model path"
     pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
-
+    if config_de['unet_type'] == 'adm':
+        model_class = UNetModel
+    elif config_de['unet_type'] == 'songunet':
+        model_class = SongUNet
     if arg.resume is not None:
         training_state = torch.load(arg.resume, map_location = 'cpu')
         start_iter = training_state['iter']
-        if config_de['unet_type'] == 'adm':
-            model_class = UNetModel
-        elif config_de['unet_type'] == 'songunet':
-            model_class = SongUNet
         now_iteration = arg.iterations
         flow_model = model_class(**config_de)
         flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][1]))

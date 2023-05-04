@@ -39,8 +39,7 @@ class BaseFlow():
     return traj
 
   @torch.no_grad()
-  def sample_ode_generative(self, z1=None, N=None, use_tqdm=True, solver = 'euler',momentum=0.0):
-    model_fn = lambda z,t: self.model(z,t)
+  def sample_ode_generative(self, z1=None, N=None, use_tqdm=True, solver = 'euler'):
     assert solver in ['euler', 'heun']
     tq = tqdm if use_tqdm else lambda x: x
     if N is None:
@@ -54,7 +53,7 @@ class BaseFlow():
     x0hat_list = []
     z = z1.detach().clone()
     batchsize = z.shape[0]
-    vt = 0.
+    
     traj.append(z.detach().clone())
     for i in tq(reversed(range(1,N+1))):
       t = torch.ones((batchsize,1), device=self.device) * i / N
@@ -62,18 +61,13 @@ class BaseFlow():
       if len(z1.shape) == 2:
         if solver == 'heun':
           raise NotImplementedError("Heun's method not implemented for 2D data.")
-        _vt = model_fn(z, t)
+        vt = self.model(z, t)
       elif len(z1.shape) == 4:
-        _vt = model_fn(z, t.squeeze())
-        if solver == 'heun':
-          if i!=1:
-            z_next = z.detach().clone() + _vt * dt
-            vt_next = model_fn(z_next, t_next.squeeze())
-            _vt = (_vt + vt_next) / 2
-            if i==N:
-              vt = _vt.detach().clone()
-            else:
-              vt = _vt.detach().clone() *(1-momentum) + momentum * vt
+        vt = self.model(z, t.squeeze())
+        if solver == 'heun' and i > 1:
+          z_next = z.detach().clone() + vt * dt
+          vt_next = self.model(z_next, t_next.squeeze())
+          vt = (vt + vt_next) / 2
         x0hat = z - vt * t.view(-1,1,1,1)
         x0hat_list.append(x0hat)
       
@@ -81,6 +75,7 @@ class BaseFlow():
       z = z.detach().clone() + vt * dt
       
       traj.append(z.detach().clone())
+
     return traj, x0hat_list
 
   
@@ -349,7 +344,7 @@ class ConsistencyFlow(RectifiedFlow):
   def __init__(self, device,model, ema_model,num_steps=1000,TN=16,discrete=False):
     self.ema_model = ema_model
     import copy
-    self.pre_train_model = copy.deepcopy(ema_model)
+    self.pre_train_model = copy.deepcopy(model.module)
     self.discrete = discrete
     self.model = model
     self.N = num_steps
