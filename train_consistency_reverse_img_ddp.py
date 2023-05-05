@@ -6,7 +6,7 @@ python train_consistency_reverse_img_ddp.py --N 16 --gpu 0,1,2,3 --dir ./runs/ci
  --pretrain ./runs/cifar10-beta20/flow_model_500000_ema.pth --preforward ./runs/cifar10-beta20/forward_model_500000_ema.pth --independent
 
 python train_consistency_reverse_img_ddp.py --N 16 --gpu 0,1,2,3 --dir ./runs/mnist-consistency-beta20/ \
---weight_prior 20 --learning_rate 3e-4 --dataset cifar10 --warmup_steps 5000 --optimizer adam --batchsize 256 --iterations 50000 --config_en configs/cifar10_en.json --config_de configs/cifar10_de.json \
+--weight_prior 20 --learning_rate 3e-4 --dataset mnist --warmup_steps 5000 --optimizer adam --batchsize 256 --iterations 50000 --config_en configs/mnist_en.json --config_de configs/mnist_de.json \
  --pretrain ./runs/mnist-beta20/flow_model_50000_ema.pth --preforward ./runs/mnist-beta20/forward_model_50000_ema.pth --independent --ema_rate 0.999945
 """
 import torch

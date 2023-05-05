@@ -53,6 +53,7 @@ def get_args():
     parser.add_argument('--batchsize', type=int, default = 256, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default = 8e-4, help='Learning rate')
     parser.add_argument('--T-N',type=int,default=32, help='sampling steps in training')
+    parser.add_argument('--sampling_steps',type=int,default=16, help='sampling steps in valing')
     parser.add_argument('--resume', type=str, default = None, help='Training state path')
     parser.add_argument('--pretrain', type=str, default = None, help='Pretrain model state path')
     parser.add_argument('--N', type=int, default = 16, help='Number of sampling steps')
@@ -69,7 +70,7 @@ def get_args():
     return arg
 
 
-def train_rectified_flow(rank, rectified_flow, optimizer, data_loader, iterations, device, start_iter, warmup_steps, dir, learning_rate, use_ema, samples_test, sampling_steps, ii, arg):
+def train_rectified_flow(rank, rectified_flow, optimizer, data_loader, iterations, device, start_iter, warmup_steps, dir, learning_rate, samples_test, sampling_steps, ii, arg):
     if rank == 0:
         writer = tensorboardX.SummaryWriter(log_dir=dir)
     samples_test = samples_test.to(device)
@@ -88,6 +89,7 @@ def train_rectified_flow(rank, rectified_flow, optimizer, data_loader, iteration
             train_iter = iter(data_loader)
             x, _ = next(train_iter)
         x = x.to(device)
+        z = torch.randn_like(x).to(x.device)
         pred_z_t,gt_z_t = rectified_flow.get_train_tuple(z0=x, z1=z)
         # Learn reverse model
         loss_fm = criticion(pred_z_t , gt_z_t)
@@ -97,9 +99,6 @@ def train_rectified_flow(rank, rectified_flow, optimizer, data_loader, iteration
         optimizer.step()
         
         # Gather loss from all processes using torch.distributed.all_gather
-
-        if isinstance(loss_prior,torch.Tensor):
-            loss_prior = loss_prior.item()
         if i % 100 == 0 and rank == 0:
             print(f"Iteration {i}: loss {loss.item()}, loss_fm {loss_fm.item()}")
             writer.add_scalar("loss", loss.item(), i)
@@ -232,7 +231,7 @@ def parse_config(config_path):
     return config
 
 def main(rank: int, world_size: int, arg):
-    ddp_setup(rank, world_size)
+    ddp_setup(rank, world_size,arg)
     device = torch.device(f"cuda:{rank}")
     assert arg.config_de is not None
     config_de = parse_config(arg.config_de)
@@ -240,15 +239,14 @@ def main(rank: int, world_size: int, arg):
 
     assert arg.pretrain is not None, "Please specify the pretrain model path"
     pretrain_state = torch.load(arg.pretrain, map_location = 'cpu')
-
+    if config_de['unet_type'] == 'adm':
+        model_class = UNetModel
+    elif config_de['unet_type'] == 'songunet':
+        model_class = SongUNet
     if arg.resume is not None:
         training_state = torch.load(arg.resume, map_location = 'cpu')
         start_iter = training_state['iter']
         start_ii = training_state['ii']
-        if config_de['unet_type'] == 'adm':
-            model_class = UNetModel
-        elif config_de['unet_type'] == 'songunet':
-            model_class = SongUNet
         flow_model = model_class(**config_de)
         flow_model.load_state_dict(convert_ddp_state_dict_to_single(training_state['model_state_dict'][0]))
         print("Successfully Load Checkpoint!")
@@ -272,11 +270,11 @@ def main(rank: int, world_size: int, arg):
     else:
         raise NotImplementedError
     ema_model = copy.deepcopy(flow_model)
-    rectified_flow = ProgDistFlow(device, flow_model, ema_model, num_steps = arg.N)
+    rectified_flow = ProgDistFlow(device, flow_model, ema_model, TN = arg.N)
     for ii in range(start_ii,arg.distill_number):
-        train_rectified_flow(rank, rectified_flow, optimizer, data_loader, arg.iterations, device, start_iter, arg.warmup_steps, dir, arg.learning_rate, arg.use_ema, samples_test, arg.sampling_steps, ii, arg)
+        train_rectified_flow(rank, rectified_flow, optimizer, data_loader, arg.iterations, device, start_iter, arg.warmup_steps, arg.dir, arg.learning_rate, samples_test, arg.sampling_steps, ii, arg)
         rectified_flow.teacher_model = copy.deepcopy(rectified_flow.student_model)
-        rectified_flow = ProgDistFlow(device, rectified_flow.student_model, rectified_flow.teacher_model, num_steps = arg.N//(2**ii))
+        rectified_flow = ProgDistFlow(device, rectified_flow.student_model, rectified_flow.teacher_model, TN = arg.N//(2**ii))
     destroy_process_group()
 
 if __name__ == "__main__":
