@@ -5,7 +5,7 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Script for calculating Frechet Inception Distance (FID)."""
+"""Script for calculating Inception Score (IS)."""
 
 import os
 import click
@@ -81,25 +81,6 @@ def calculate_is_from_inception_stats(gen_probs):
 
 @click.group()
 def main():
-    """Calculate Frechet Inception Distance (FID).
-
-    Examples:
-
-    \b
-    # Generate 50000 images and save them as fid-tmp/*/*.png
-    torchrun --standalone --nproc_per_node=1 generate.py --outdir=fid-tmp --seeds=0-49999 --subdirs \\
-        --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
-
-    \b
-    # Calculate FID
-    torchrun --standalone --nproc_per_node=1 fid.py calc --images=fid-tmp \\
-        --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
-
-    \b
-    # Compute dataset reference statistics
-    python fid.py ref --data=datasets/my-dataset.zip --dest=fid-refs/my-dataset.npz
-    """
-
 #----------------------------------------------------------------------------
 
 @main.command()
@@ -110,7 +91,7 @@ def main():
 @click.option('--batch',                help='Maximum batch size', metavar='INT',                   type=click.IntRange(min=1), default=64, show_default=True)
 
 def calc(image_path, ref_path, num_expected, seed, batch):
-    """Calculate FID for a given set of images."""
+    """Calculate IS for a given set of images."""
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
 
@@ -130,6 +111,40 @@ def calc(image_path, ref_path, num_expected, seed, batch):
         with open(os.path.join(image_path, 'is.txt'), 'w') as f:
             f.write(str(_is))
     torch.distributed.barrier()
+
+
+@main.command(name='calc_multiple')
+@click.option('--images', 'image_paths', help='Path to the images', metavar='PATH|ZIP',              type=click.Path(exists=True), multiple=True, required=True)
+@click.option('--ref', 'ref_path',      help='Dataset reference statistics ', metavar='NPZ|URL',    type=str, required=True)
+@click.option('--num', 'num_expected',  help='Number of images to use', metavar='INT',              type=click.IntRange(min=2), default=50000, show_default=True)
+@click.option('--seed',                 help='Random seed for selecting the images', metavar='INT', type=int, default=0, show_default=True)
+@click.option('--batch',                help='Maximum batch size', metavar='INT',                   type=click.IntRange(min=1), default=64, show_default=True)
+
+def calc_multiple(image_paths, ref_path, num_expected, seed, batch):
+    """Calculate IS for a given set of images."""
+    torch.multiprocessing.set_start_method('spawn')
+    os.environ['MASTER_PORT'] = f"{29500+ int(os.environ['CUDA_VISIBLE_DEVICES'])+1}"
+    print(os.environ['MASTER_PORT'])
+    dist.init()
+    dist.print0(f'Loading dataset reference statistics from "{ref_path}"...')
+    ref = None
+    if dist.get_rank() == 0:
+        with dnnlib.util.open_url(ref_path) as f:
+            ref = dict(np.load(f))
+
+    iss = []
+    for image_path in image_paths:
+        gen_probs = calculate_inception_stats(image_path=image_path, num_expected=num_expected, seed=seed, max_batch_size=batch)
+        dist.print0(f'Calculating IS for images in {image_path}...')
+        if dist.get_rank() == 0:
+            _is = calculate_is_from_inception_stats(gen_probs)
+            print(f'IS for images in {image_path}: {_is:g}')
+            iss.append(round(_is,2))
+            # Save to image_path as a txt file
+            with open(os.path.join(image_path, 'is_multiplt.txt'), 'w') as f:
+                f.write(str(_is)+"\n")
+        torch.distributed.barrier()
+    print(_is)
 
 #----------------------------------------------------------------------------
 

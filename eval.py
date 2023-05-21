@@ -19,7 +19,7 @@ from network_edm import SongUNet
 from torch.nn import DataParallel
 import json,copy
 from utils import convert_ddp_state_dict_to_single,InfiniteDataLoaderIterator
-from train_reverse_img_ddp import parse_config
+from train_cud_reverse_img_ddp import parse_config
 """
 python eval.py --gpu 0 --dir ./runs/cifar10-onlineslim-predstep-1-noema-beta20/ --N 16 --res 32 \
       --input_nc 3 --num_samples 500 --ckpt ./runs/cifar10-onlineslim-predstep-1-noema-beta20/flow_model_500000_ema.pth \
@@ -102,7 +102,7 @@ def main(arg):
         forward_model = torch.compile(forward_model,backend="inductor")
         forward_model.load_state_dict(convert_ddp_state_dict_to_single(torch.load(arg.encoder,map_location='cpu')), strict = True)
         forward_model = forward_model.to(device).eval()
-    from train_reverse_img_ddp import get_loader
+    from train_cud_reverse_img_ddp import get_loader
     data_loader, _, _, _ = get_loader(arg.dataset, arg.batchsize, 1, 0)
     train_iter = InfiniteDataLoaderIterator(data_loader)
     # Save configs as json file

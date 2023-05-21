@@ -8,7 +8,6 @@
 """
 import torch
 import numpy as np
-from flows import ConsistencyFlow,OnlineSlimFlow,RectifiedFlow
 import torch.nn as nn
 import tensorboardX
 import os,copy
@@ -23,7 +22,7 @@ import argparse
 from tqdm import tqdm
 import json 
 from EMA import EMA,EMAMODEL
-from network_edm import SongUNet,DWTUNet,MetaGenerator
+from network_edm import SongUNet,DWTUNet
 # DDP
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
@@ -40,9 +39,6 @@ def ddp_setup(rank, world_size,arg):
     """
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = f"{12359+int(arg.gpu[0])}"
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-    # Windows
-    # init_process_group(backend="gloo", rank=rank, world_size=world_size)
     # Linux
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 

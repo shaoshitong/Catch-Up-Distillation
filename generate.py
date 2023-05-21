@@ -18,7 +18,7 @@ from tqdm import tqdm
 from network_edm import SongUNet,MetaGenerator
 from torch.nn import DataParallel
 import json
-from train_reverse_img_ddp import parse_config
+from train_cud_reverse_img_ddp import parse_config
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -133,7 +133,7 @@ def main(arg):
     rectified_flow.model.eval()
 
     if arg.encoder is not None:
-        from train_reverse_img_ddp import get_loader
+        from train_cud_reverse_img_ddp import get_loader
         config_en = parse_config(arg.config_en)
         if config_en['unet_type'] == 'adm':
             encoder_class = UNetModel
