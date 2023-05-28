@@ -472,47 +472,114 @@ class CatchUpFlow(RectifiedFlow):
       model_fn = lambda z,t: self.model(z,t)
     else:
       model_fn = lambda z,t: self.generator_list[generator_id-2](self.model(z,t,return_features=True)[1])
-    assert solver in ['euler', 'heun']
+    assert solver in ['euler', 'heun', 'dpm_solver_2', 'dpm_solver_3']
     tq = tqdm if use_tqdm else lambda x: x
     if N is None:
-      N = self.N    
-    if solver == 'heun' and N % 2 == 0:
-      raise ValueError("N must be odd when using Heun's method.")
-    if solver == 'heun':
-      N = (N + 1) // 2
+      N = self.N
     dt = -1./N
-    traj = [] # to store the trajectory
-    x0hat_list = []
-    z = z1.detach().clone()
-    batchsize = z.shape[0]
-    vt = 0.
-    traj.append(z.detach().clone())
-    for i in tq(reversed(range(1,N+1))):
-      t = torch.ones((batchsize,1), device=self.device) * i / N
-      t_next = torch.ones((batchsize,1), device=self.device) * (i-1) / N
-      if len(z1.shape) == 2:
-        if solver == 'heun':
-          raise NotImplementedError("Heun's method not implemented for 2D data.")
-        _vt = model_fn(z, t)
-      elif len(z1.shape) == 4:
-        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
-        if solver == 'heun':
-          if i!=1:
-            z_next = z.detach().clone() + _vt * dt
-            vt_next = model_fn(z_next, (t_next*self.TN).int().squeeze() if self.discrete else t_next.squeeze())
-            _vt = (_vt + vt_next) / 2
-        if i==N:
-          vt = _vt.detach().clone()
-        else:
-          vt = _vt.detach().clone() *(1-momentum) + momentum * vt
-        x0hat = z - vt * t.view(-1,1,1,1)
-        x0hat_list.append(x0hat)
-      
-      z = z.detach().clone() + vt * dt
-      
+    if solver in  ['euler', 'heun']:
+      if solver == 'heun' and N % 2 == 0:
+        raise ValueError("N must be odd when using Heun's method.")
+      if solver == 'heun':
+        N = (N + 1) // 2
+      traj = [] # to store the trajectory
+      x0hat_list = []
+      z = z1.detach().clone()
+      batchsize = z.shape[0]
+      vt = 0.
       traj.append(z.detach().clone())
-    return traj, x0hat_list
-  
+      for i in tq(reversed(range(1,N+1))):
+        t = torch.ones((batchsize,1), device=self.device) * i / N
+        t_next = torch.ones((batchsize,1), device=self.device) * (i-1) / N
+        if len(z1.shape) == 2:
+          if solver == 'heun':
+            raise NotImplementedError("Heun's method not implemented for 2D data.")
+          _vt = model_fn(z, t)
+        elif len(z1.shape) == 4:
+          _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+          if solver == 'heun':
+            if i!=1:
+              z_next = z.detach().clone() + _vt * dt
+              vt_next = model_fn(z_next, (t_next*self.TN).int().squeeze() if self.discrete else t_next.squeeze())
+              _vt = (_vt + vt_next) / 2
+          if i==N:
+            vt = _vt.detach().clone()
+          else:
+            vt = _vt.detach().clone() *(1-momentum) + momentum * vt
+          x0hat = z - vt * t.view(-1,1,1,1)
+          x0hat_list.append(x0hat)
+        
+        z = z.detach().clone() + vt * dt
+        
+        traj.append(z.detach().clone())
+      return traj, x0hat_list
+    else:
+      prev_velocity_list = []
+      prev_t_list = []
+      traj = [] # to store the trajectory
+      x0hat_list = []
+      if solver == "dpm_solver_2":
+        assert N>=2,"In DPM-Solver-2, N must > 2"
+        t_begin = torch.ones((batchsize,1), device=self.device)
+        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+        prev_velocity_list.append(_vt)
+        prev_t_list.append(t_begin)
+        z = z.detach().clone() + _vt*dt
+        traj.append(z.detach().clone())
+        x0hat = z - _vt * t.view(-1,1,1,1)
+        x0hat_list.append(x0hat)
+
+        for i in tq(reversed(range(1,N))):
+            t = torch.ones((batchsize,1), device=self.device) * i / N
+            _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+            prev_velocity_list.append(_vt)
+            prev_t_list.append(t)
+            del prev_velocity_list[0]
+            del prev_t_list[0]
+            D1 = (prev_velocity_list[-1] - prev_velocity_list[-2])*N
+            z = z.detach().clone() + _vt*dt - dt*dt*D1/2
+            traj.append(z.detach().clone())
+            x0hat = z - _vt * t.view(-1,1,1,1) - t.view(-1,1,1,1)* t.view(-1,1,1,1)* D1/2
+            x0hat_list.append(x0hat)
+        return traj, x0hat_list
+      elif solver == "dpm_solver_3":
+        assert N>=3,"In DPM-Solver-3, N must > 3"
+        t_begin = torch.ones((batchsize,1), device=self.device)
+        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+        prev_velocity_list.append(_vt)
+        prev_t_list.append(t_begin)
+        z = z.detach().clone() + _vt*dt
+        traj.append(z.detach().clone())
+        x0hat = z - _vt * t.view(-1,1,1,1)
+        x0hat_list.append(x0hat)
+
+        t_next = torch.ones((batchsize,1), device=self.device) * (N-1)/N
+        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+        prev_velocity_list.append(_vt)
+        prev_t_list.append(t_next)
+        z = z.detach().clone() + _vt*dt - dt*(prev_velocity_list[-1]-prev_velocity_list[-2])/2
+        traj.append(z.detach().clone())
+        x0hat = z - _vt * t.view(-1,1,1,1) - t*t*N*(prev_velocity_list[-1]-prev_velocity_list[-2])/2
+        x0hat_list.append(x0hat)
+
+        for i in tq(reversed(range(1,N-1))):
+            t = torch.ones((batchsize,1), device=self.device) * i / N
+            _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+            prev_velocity_list.append(_vt)
+            prev_t_list.append(t)
+            del prev_velocity_list[0]
+            del prev_t_list[0]
+            D1_0 = N*(prev_velocity_list[-1] - prev_velocity_list[-2])
+            D1_1 = N*(prev_velocity_list[-2] - prev_velocity_list[-3])
+            D2 = N * (D1_0 - D1_1) / 2
+            D1 = D1_0 + D2 / (2*N)
+            z = z.detach().clone() + _vt*dt - dt*dt*D1/2 + dt*dt*dt*D2/6
+            traj.append(z.detach().clone())
+            x0hat = z - _vt * t.view(-1,1,1,1) - t.view(-1,1,1,1)* t.view(-1,1,1,1)* D1/2 + t.view(-1,1,1,1)*t.view(-1,1,1,1)*t.view(-1,1,1,1)*D2/6 
+            x0hat_list.append(x0hat)
+        return traj, x0hat_list
+
+
   @torch.no_grad()
   def sample_ode(self, z0=None, N=None):
     ### NOTE: Use Euler method to sample from the learned flow
