@@ -2,7 +2,7 @@
 
 import torch
 import numpy as np
-from flows import RectifiedFlow,ResidualFlow,OnlineSlimFlow
+from flows import CatchUpFlow
 import torch.nn as nn
 import tensorboardX
 import os
@@ -39,7 +39,7 @@ def get_args():
     parser.add_argument('--save_sub_traj', action='store_true', help='Save the sub trajectories')   
     parser.add_argument('--save_z', action='store_true', help='Save zs for distillation')    
     parser.add_argument('--save_data', action='store_true', help='Save data')    
-    parser.add_argument('--solver', type=str, default = 'euler', help='ODE solvers [euler, heun, rk]')
+    parser.add_argument('--solver', type=str, default = 'euler', help='ODE solvers [euler, heun, rk, dpm_solver-2/3,deis-2/3]')
     parser.add_argument('--config_de', type=str, default = None, help='Decoder config path, must be .json file')
     parser.add_argument('--config_en', type=str, default = None, help='Encoder config path, must be .json file')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
@@ -128,7 +128,7 @@ def main(arg):
             meta_generator.eval()
             generator_list.append(meta_generator)
         
-    rectified_flow = OnlineSlimFlow(device, flow_model, flow_model, generator_list, num_steps = arg.N,add_prior_z=False,discrete=arg.discrete)
+    rectified_flow = CatchUpFlow(device, flow_model, flow_model, generator_list, num_steps = arg.N,add_prior_z=False,discrete=arg.discrete)
 
     rectified_flow.model.eval()
 
@@ -177,7 +177,7 @@ def main(arg):
             # Compute the norm of z
             z_list.append(z)
             save_image(z, "debug2.jpg")
-            if arg.solver in ['euler', 'heun']:
+            if arg.solver in  ['euler', 'heun','dpm_solver_2','dpm_solver_3','deis_2','deis_3']:
                 traj_uncond, traj_uncond_x0 = rectified_flow.sample_ode_generative(z1=z, N=arg.N, use_tqdm = False, solver = arg.solver,momentum=arg.momentum,generator_id=arg.generator)
                 x0 = traj_uncond[-1]
                 uncond_straightness = straightness_no_mean(traj_uncond)
@@ -187,7 +187,7 @@ def main(arg):
                 nfes.append(nfe)
                 # print(f"nfe: {nfe}")
 
-            if arg.save_traj and arg.solver in ['euler', 'heun']:
+            if arg.save_traj and arg.solver in ['euler', 'heun','dpm_solver_2','dpm_solver_3','deis_2','deis_3']:
                 if len(traj_uncond_x0) > 10:
                     interval = len(traj_uncond_x0) // 5
                     grid = torch.cat(traj_uncond_x0[::interval], dim=3)
@@ -207,14 +207,14 @@ def main(arg):
                     np.save(os.path.join(arg.dir, "zs", f"{i:05d}.npy"), z[idx].cpu().numpy())
                 if arg.save_data:
                     save_image(x[idx] * 0.5 + 0.5 if not arg.no_scale else x[idx], os.path.join(arg.dir, "data", f"{i:05d}.png"))
-                if arg.save_sub_traj and arg.solver in ['euler', 'heun']:
+                if arg.save_sub_traj and arg.solver in ['euler', 'heun','dpm_solver_2','dpm_solver_3','deis_2','deis_3']:
                     for mm,trag_sub_x0 in enumerate(traj_uncond_x0):
                         save_image(trag_sub_x0[idx]* 0.5 + 0.5 if not arg.no_scale else trag_sub_x0[idx], os.path.join(arg.dir, f"trajs_{mm}", f"{i:05d}.png"))
                 i+=1
                 if i >= arg.num_samples:
                     break
             x0_list.append(x0)
-        if arg.solver in ['euler', 'heun']:
+        if arg.solver in ['euler', 'heun','dpm_solver_2','dpm_solver_3','deis_2','deis_3']:
             straightness_list = torch.stack(straightness_list).mean(dim=0).tolist()
             print(f"cosine list: {straightness_list}")
         nfes_mean = np.mean(nfes) if len(nfes) > 0 else arg.N
