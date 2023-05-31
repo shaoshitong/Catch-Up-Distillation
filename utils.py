@@ -257,5 +257,5 @@ def merge_images(folder_path, output_path, n, m):
     result.save(output_path)
     
 if __name__=="__main__":
-    for i in range(7):
-        merge_images(f"./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-discrete-beta20/test_8/trajs_{i}/", f"./runs/cifar10-onlineslim-predstep-1-uniform-shakedrop0.75-discrete-beta20/test_8/sample_trajs_{i}.png",15,15)
+    for i in range(6):
+        merge_images(f"/home/Bigdata/ode_flow_runs/deis_2/test_7/trajs_{i}/", f"trajs_{i}.png",15,15)

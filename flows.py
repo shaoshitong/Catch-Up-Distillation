@@ -514,6 +514,8 @@ class CatchUpFlow(RectifiedFlow):
         traj.append(z.detach().clone())
       return traj, x0hat_list
     else:
+      z = z1.detach().clone()
+      batchsize = z.shape[0]
       prev_velocity_list = []
       prev_t_list = []
       traj = [] # to store the trajectory
@@ -521,12 +523,12 @@ class CatchUpFlow(RectifiedFlow):
       if solver == "dpm_solver_2":
         assert N>=2,"In DPM-Solver-2, N must > 2"
         t_begin = torch.ones((batchsize,1), device=self.device)
-        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+        _vt = model_fn(z, (t_begin*self.TN).int().squeeze() if self.discrete else t_begin.squeeze())
         prev_velocity_list.append(_vt)
         prev_t_list.append(t_begin)
         z = z.detach().clone() + _vt*dt
         traj.append(z.detach().clone())
-        x0hat = z - _vt * t.view(-1,1,1,1)
+        x0hat = z - _vt * t_begin.view(-1,1,1,1)
         x0hat_list.append(x0hat)
 
         for i in tq(reversed(range(1,N))):
@@ -534,10 +536,10 @@ class CatchUpFlow(RectifiedFlow):
             _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
             prev_velocity_list.append(_vt)
             prev_t_list.append(t)
-            del prev_velocity_list[0]
-            del prev_t_list[0]
             D1 = (prev_velocity_list[-1] - prev_velocity_list[-2])*N
             z = z.detach().clone() + _vt*dt - dt*dt*D1/2
+            del prev_velocity_list[0]
+            del prev_t_list[0]
             traj.append(z.detach().clone())
             x0hat = z - _vt * t.view(-1,1,1,1) - t.view(-1,1,1,1)* t.view(-1,1,1,1)* D1/2
             x0hat_list.append(x0hat)
@@ -545,21 +547,21 @@ class CatchUpFlow(RectifiedFlow):
       elif solver == "dpm_solver_3":
         assert N>=3,"In DPM-Solver-3, N must > 3"
         t_begin = torch.ones((batchsize,1), device=self.device)
-        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+        _vt = model_fn(z, (t_begin*self.TN).int().squeeze() if self.discrete else t_begin.squeeze())
         prev_velocity_list.append(_vt)
         prev_t_list.append(t_begin)
         z = z.detach().clone() + _vt*dt
         traj.append(z.detach().clone())
-        x0hat = z - _vt * t.view(-1,1,1,1)
+        x0hat = z - _vt * t_begin.view(-1,1,1,1)
         x0hat_list.append(x0hat)
 
         t_next = torch.ones((batchsize,1), device=self.device) * (N-1)/N
-        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+        _vt = model_fn(z, (t_next*self.TN).int().squeeze() if self.discrete else t_begin.squeeze())
         prev_velocity_list.append(_vt)
         prev_t_list.append(t_next)
-        z = z.detach().clone() + _vt*dt - dt*(prev_velocity_list[-1]-prev_velocity_list[-2])/2
+        z = z.detach().clone() + _vt*dt - dt * (prev_velocity_list[-1]-prev_velocity_list[-2])/2
         traj.append(z.detach().clone())
-        x0hat = z - _vt * t.view(-1,1,1,1) - t*t*N*(prev_velocity_list[-1]-prev_velocity_list[-2])/2
+        x0hat = z - _vt * t_next.view(-1,1,1,1) - t_next.view(-1,1,1,1)*t_next.view(-1,1,1,1)*N*(prev_velocity_list[-1]-prev_velocity_list[-2])/2
         x0hat_list.append(x0hat)
 
         for i in tq(reversed(range(1,N-1))):
@@ -567,12 +569,12 @@ class CatchUpFlow(RectifiedFlow):
             _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
             prev_velocity_list.append(_vt)
             prev_t_list.append(t)
-            del prev_velocity_list[0]
-            del prev_t_list[0]
             D1_0 = N*(prev_velocity_list[-1] - prev_velocity_list[-2])
             D1_1 = N*(prev_velocity_list[-2] - prev_velocity_list[-3])
             D2 = N * (D1_0 - D1_1) / 2
-            D1 = D1_0 + D2 / (2*N)
+            D1 = D1_0 + D2 / N
+            del prev_velocity_list[0]
+            del prev_t_list[0]
             z = z.detach().clone() + _vt*dt - dt*dt*D1/2 + dt*dt*dt*D2/6
             traj.append(z.detach().clone())
             x0hat = z - _vt * t.view(-1,1,1,1) - t.view(-1,1,1,1)* t.view(-1,1,1,1)* D1/2 + t.view(-1,1,1,1)*t.view(-1,1,1,1)*t.view(-1,1,1,1)*D2/6 
@@ -580,29 +582,40 @@ class CatchUpFlow(RectifiedFlow):
         return traj, x0hat_list
       elif solver == "deis_2":
         assert N>=2,"In DEIS-2, N must > 2"
+
         t_begin = torch.ones((batchsize,1), device=self.device)
-        _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
+        _vt = model_fn(z, (t_begin*self.TN).int().squeeze() if self.discrete else t_begin.squeeze())
         prev_velocity_list.append(_vt)
         prev_t_list.append(t_begin)
         z = z.detach().clone() + _vt*dt
         traj.append(z.detach().clone())
-        x0hat = z - _vt * t.view(-1,1,1,1)
+        x0hat = z - _vt * t_begin.view(-1,1,1,1)
+        x0hat_list.append(x0hat) # First Appling Euler
+
+        t_begin = torch.ones((batchsize,1), device=self.device) * (N-1) / N
+        _vt = model_fn(z, (t_begin*self.TN).int().squeeze() if self.discrete else t_begin.squeeze())
+        prev_velocity_list.append(_vt)
+        prev_t_list.append(t_begin)
+        z = z.detach().clone() + _vt*dt
+        traj.append(z.detach().clone())
+        x0hat = z - _vt * t_begin.view(-1,1,1,1)
         x0hat_list.append(x0hat) # First Appling Euler
 
         def ploynomial(pred_v_list,pred_t_list,cur_t,order):
-          using_pred_t_list = torch.Tensor(pred_t_list[-order:])
-          using_pred_v_list = torch.Tensor(pred_v_list[-order:])
+          using_pred_t_list = torch.stack(pred_t_list[-order:],0)
+          using_pred_t_list = using_pred_t_list.mean([1,2])
+          using_pred_v_list = torch.stack(pred_v_list[-order:],0)
           sub_pred_t_list = using_pred_t_list[...,None] - using_pred_t_list[None,...]
           sub_pred_t_list = torch.where(sub_pred_t_list==0,1,sub_pred_t_list)
           desum = torch.prod(sub_pred_t_list,1)
-          sub_cur_t = cur_t - using_pred_t_list[None,...].expand(order,1)
-          sum = torch.prod(torch.where((torch.eye(cur_t.shape[0]).int() == 1),1,sub_cur_t),1)
-          ploy_result = (sum / desum).view(order,1,1,1,1) * torch.cat([pred_v_list],dim=0)
+          sub_cur_t = cur_t - using_pred_t_list[None,...].expand(order,-1)
+          sum = torch.prod(torch.where((torch.eye(sub_cur_t.shape[0]).bool().to(sub_cur_t.device)),1,sub_cur_t),1)
+          ploy_result = (sum / desum).view(order,1,1,1,1) * using_pred_v_list
           return ploy_result.sum(0)
 
         def integral(func,start,end,item,pred_v_list,pred_t_list,order):
           result = 0
-          points = torch.linspace(start,end,(end-start)/item)
+          points = torch.linspace(start,end,item)
           for i in range(points.shape[0]):
             result += func(pred_v_list,pred_t_list,points[i],order)
           result /= item
@@ -613,10 +626,10 @@ class CatchUpFlow(RectifiedFlow):
             _vt = model_fn(z, (t*self.TN).int().squeeze() if self.discrete else t.squeeze())
             prev_velocity_list.append(_vt)
             prev_t_list.append(t)
+            new_velocity = integral(ploynomial,i/N+dt,i/N,1000,prev_velocity_list,prev_t_list,order=3)
+            z = z.detach().clone() + dt * new_velocity
             del prev_velocity_list[0]
             del prev_t_list[0]
-            new_velocity = integral(t+dt,t,1000,prev_velocity_list,prev_t_list,order=2)
-            z = z.detach().clone() + dt * new_velocity
             traj.append(z.detach().clone())
             x0hat = z - _vt * t.view(-1,1,1,1) - t.view(-1,1,1,1) * new_velocity
             x0hat_list.append(x0hat)

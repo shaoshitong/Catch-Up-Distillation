@@ -74,7 +74,7 @@ def main(arg):
         os.makedirs(os.path.join(arg.dir, "trajs"))
     if not os.path.exists(os.path.join(arg.dir, "data")):
         os.makedirs(os.path.join(arg.dir, "data"))
-    a_N = arg.N if arg.solver == "euler" else (arg.N + 1)//2
+    a_N = arg.N if arg.solver in ["euler",'dpm_solver_2','dpm_solver_3','deis_2'] else (arg.N + 1)//2
     for i in range(a_N):
         if not os.path.exists(os.path.join(arg.dir, f"trajs_{i}")):
             os.makedirs(os.path.join(arg.dir, f"trajs_{i}"))

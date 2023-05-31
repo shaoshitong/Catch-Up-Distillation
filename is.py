@@ -81,6 +81,7 @@ def calculate_is_from_inception_stats(gen_probs):
 
 @click.group()
 def main():
+    pass
 #----------------------------------------------------------------------------
 
 @main.command()
