@@ -1,7 +1,7 @@
 # Paper
 Catch-Up Distillation: You Only Need to Train Once for Accelerating Sampling [paper](https://arxiv.org/abs/2305.10769).
 
-Only code for experiments on CIFAR-10 and MNIST are presented here. ImagNet-64 and other experiments are still being added and will be implemented based on the official Consistency Model respository.
+Only code for experiments on CIFAR-10 and MNIST are presented here. ImagNet-64 ate implemented based on the official Consistency Model respository, which can be found in [Catch-Up-Distillation-ImageNet-64x64](https://github.com/shaoshitong/Catch-Up-Distillation-ImageNet-64x64).
 
 Our Runge-Kutta-based multi-step alignment distillation method can be formulated as
 ![Teaser image](./images/cud.png)
